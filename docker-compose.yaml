@@ -1,0 +1,76 @@
+
+
+services:
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    container_name: llm-gateway
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./litellm_config.yaml:/app/config.yaml
+    env_file:
+      - .env
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    command:
+      - "--config"
+      - "/app/config.yaml"
+      - "--port"
+      - "4000"
+      # - "--detailed_debug"    # uncomment to debug (WARNING: logs API keys)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # access host Ollama
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/readiness', timeout=5).status == 200 else 1)",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  docs:
+    image: python:3.12-alpine
+    container_name: llm-gateway-docs
+    ports:
+      - "4001:4001"
+    volumes:
+      - ./gateway_docs.py:/app/gateway_docs.py:ro
+      - ./litellm_config.yaml:/app/config.yaml:ro
+    environment:
+      - CONFIG_PATH=/app/config.yaml
+      - GATEWAY_URL=http://localhost:4000
+      - DOCS_PORT=4001
+    command: ["sh", "-c", "pip install -q pyyaml && python /app/gateway_docs.py"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4001/docs', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  redis:
+    image: redis:7-alpine
+    container_name: llm-gateway-cache
+    command: >
+      redis-server
+      --maxmemory 2gb
+      --maxmemory-policy allkeys-lru
+      --save ""
+      --appendonly no
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3

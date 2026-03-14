@@ -1,0 +1,446 @@
+# =============================================================================
+# LiteLLM Unified Free Gateway
+# Validated against live provider/model endpoints on 2026-03-14.
+#
+# Active providers verified with the current credentials:
+#   OpenRouter, Google, Cerebras, Groq, GitHub Models, Mistral,
+#   NVIDIA NIM, Cloudflare Workers AI, Cohere
+# =============================================================================
+
+model_list:
+  # ---------------------------------------------------------------------------
+  # Main aliases
+  # ---------------------------------------------------------------------------
+
+  # --- OpenRouter (1K RPD with $10 topup, tried first) ---
+  - model_name: default
+    litellm_params:
+      model: openrouter/meta-llama/llama-3.3-70b-instruct:free  # confirmed working
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: default
+    litellm_params:
+      model: openrouter/openai/gpt-oss-120b:free
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: default
+    litellm_params:
+      model: openrouter/qwen/qwen3-coder:free
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: default
+    litellm_params:
+      model: openrouter/nvidia/nemotron-3-super-120b-a12b:free
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: default
+    litellm_params:
+      model: openrouter/stepfun/step-3.5-flash:free
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: default
+    litellm_params:
+      model: openrouter/mistralai/mistral-small-3.1-24b-instruct:free
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  # --- Google AI Studio ---
+  - model_name: default
+    litellm_params:
+      model: gemini/gemini-2.5-pro                     # S-tier reasoning, 5 RPM free
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: default
+    litellm_params:
+      model: gemini/gemini-2.5-flash                   # A-tier, 10 RPM free
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: default
+    litellm_params:
+      model: mistral/mistral-small-latest
+      api_key: os.environ/MISTRAL_API_KEY
+  - model_name: default
+    litellm_params:
+      model: groq/llama-3.3-70b-versatile
+      api_key: os.environ/GROQ_API_KEY
+  - model_name: default
+    litellm_params:
+      model: cerebras/qwen-3-235b-a22b-instruct-2507
+      api_key: os.environ/CEREBRAS_API_KEY
+
+  # --- GitHub Models ---
+  - model_name: default
+    litellm_params:
+      model: github/DeepSeek-R1                        # Arena 1398, MATH 97.3%
+      api_key: os.environ/GITHUB_TOKEN
+  - model_name: default
+    litellm_params:
+      model: github/gpt-4.1                            # SWE-bench 54.6%, tools
+      api_key: os.environ/GITHUB_TOKEN
+  - model_name: default
+    litellm_params:
+      model: github/gpt-4o                             # vision + tools
+      api_key: os.environ/GITHUB_TOKEN
+  - model_name: default
+    litellm_params:
+      model: github/Llama-4-Maverick-17B-128E-Instruct-FP8  # Arena 1417
+      api_key: os.environ/GITHUB_TOKEN
+  - model_name: default
+    litellm_params:
+      model: github/Llama-3.3-70B-Instruct
+      api_key: os.environ/GITHUB_TOKEN
+  - model_name: default
+    litellm_params:
+      model: nvidia_nim/meta/llama-3.3-70b-instruct
+      api_key: os.environ/NVIDIA_NIM_API_KEY
+  - model_name: default
+    litellm_params:
+      model: cloudflare/@cf/meta/llama-3.3-70b-instruct-fp8-fast
+      api_key: os.environ/CLOUDFLARE_API_TOKEN
+  - model_name: default
+    litellm_params:
+      model: cohere/command-r-08-2024
+      api_key: os.environ/COHERE_API_KEY
+
+  - model_name: fast
+    litellm_params:
+      model: gemini/gemini-2.5-flash-lite
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: fast
+    litellm_params:
+      model: groq/llama-3.1-8b-instant
+      api_key: os.environ/GROQ_API_KEY
+  - model_name: fast
+    litellm_params:
+      model: cerebras/llama3.1-8b
+      api_key: os.environ/CEREBRAS_API_KEY
+
+  - model_name: thinking
+    litellm_params:
+      model: gemini/gemini-2.5-pro                     # strongest free reasoning
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: thinking
+    litellm_params:
+      model: cerebras/qwen-3-235b-a22b-instruct-2507
+      api_key: os.environ/CEREBRAS_API_KEY
+  - model_name: thinking
+    litellm_params:
+      model: gemini/gemini-2.5-flash
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: thinking
+    litellm_params:
+      model: groq/openai/gpt-oss-120b
+      api_key: os.environ/GROQ_API_KEY
+  - model_name: thinking
+    litellm_params:
+      model: nvidia_nim/openai/gpt-oss-120b
+      api_key: os.environ/NVIDIA_NIM_API_KEY
+  - model_name: thinking
+    litellm_params:
+      model: cloudflare/@cf/deepseek-ai/deepseek-r1-distill-qwen-32b
+      api_key: os.environ/CLOUDFLARE_API_TOKEN
+  - model_name: thinking
+    litellm_params:
+      model: github/DeepSeek-R1                        # MATH 97.3%, native CoT
+      api_key: os.environ/GITHUB_TOKEN
+  - model_name: thinking
+    litellm_params:
+      model: github/Phi-4-reasoning                    # 14B, approaches R1
+      api_key: os.environ/GITHUB_TOKEN
+  - model_name: thinking
+    litellm_params:
+      model: cohere/command-a-reasoning-08-2025
+      api_key: os.environ/COHERE_API_KEY
+
+  - model_name: coding
+    litellm_params:
+      model: github/gpt-4.1                            # SWE-bench 54.6%
+      api_key: os.environ/GITHUB_TOKEN
+  - model_name: coding
+    litellm_params:
+      model: github/DeepSeek-R1                        # SWE-bench 49.2%
+      api_key: os.environ/GITHUB_TOKEN
+  - model_name: coding
+    litellm_params:
+      model: mistral/devstral-small-latest
+      api_key: os.environ/MISTRAL_API_KEY
+  - model_name: coding
+    litellm_params:
+      model: mistral/codestral-latest
+      api_key: os.environ/MISTRAL_API_KEY
+  - model_name: coding
+    litellm_params:
+      model: groq/qwen/qwen3-32b
+      api_key: os.environ/GROQ_API_KEY
+  - model_name: coding
+    litellm_params:
+      model: cerebras/qwen-3-235b-a22b-instruct-2507
+      api_key: os.environ/CEREBRAS_API_KEY
+  - model_name: coding
+    litellm_params:
+      model: cloudflare/@cf/qwen/qwen2.5-coder-32b-instruct
+      api_key: os.environ/CLOUDFLARE_API_TOKEN
+  - model_name: coding
+    litellm_params:
+      model: gemini/gemma-3-27b-it
+      api_key: os.environ/GEMINI_API_KEY
+
+  - model_name: vision
+    litellm_params:
+      model: gemini/gemini-2.5-pro                     # strongest free multimodal
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: vision
+    litellm_params:
+      model: gemini/gemini-2.5-flash
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: vision
+    litellm_params:
+      model: github/gpt-4o                             # strong vision + tools
+      api_key: os.environ/GITHUB_TOKEN
+  - model_name: vision
+    litellm_params:
+      model: github/gpt-4.1                            # Video-MME 72%
+      api_key: os.environ/GITHUB_TOKEN
+  - model_name: vision
+    litellm_params:
+      model: mistral/pixtral-large-latest
+      api_key: os.environ/MISTRAL_API_KEY
+  - model_name: vision
+    litellm_params:
+      model: nvidia_nim/google/gemma-3-27b-it
+      api_key: os.environ/NVIDIA_NIM_API_KEY
+  - model_name: vision
+    litellm_params:
+      model: cohere/command-a-vision-07-2025
+      api_key: os.environ/COHERE_API_KEY
+
+  - model_name: tools
+    litellm_params:
+      model: github/gpt-4.1                            # designed for tool calling
+      api_key: os.environ/GITHUB_TOKEN
+  - model_name: tools
+    litellm_params:
+      model: github/gpt-4o                             # strong native tools
+      api_key: os.environ/GITHUB_TOKEN
+  - model_name: tools
+    litellm_params:
+      model: gemini/gemini-2.5-pro                     # best free model for tools
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: tools
+    litellm_params:
+      model: gemini/gemini-2.5-flash
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: tools
+    litellm_params:
+      model: mistral/mistral-small-latest
+      api_key: os.environ/MISTRAL_API_KEY
+  - model_name: tools
+    litellm_params:
+      model: groq/llama-3.3-70b-versatile
+      api_key: os.environ/GROQ_API_KEY
+  - model_name: tools
+    litellm_params:
+      model: cohere/command-r-08-2024
+      api_key: os.environ/COHERE_API_KEY
+
+  - model_name: big
+    litellm_params:
+      model: cerebras/qwen-3-235b-a22b-instruct-2507
+      api_key: os.environ/CEREBRAS_API_KEY
+  - model_name: big
+    litellm_params:
+      model: nvidia_nim/nvidia/llama-3.1-nemotron-ultra-253b-v1
+      api_key: os.environ/NVIDIA_NIM_API_KEY
+  - model_name: big
+    litellm_params:
+      model: groq/openai/gpt-oss-120b
+      api_key: os.environ/GROQ_API_KEY
+  - model_name: big
+    litellm_params:
+      model: cloudflare/@cf/openai/gpt-oss-120b
+      api_key: os.environ/CLOUDFLARE_API_TOKEN
+
+  - model_name: local
+    litellm_params:
+      model: ollama/lightrag:latest
+      api_base: os.environ/OLLAMA_API_BASE
+      timeout: 180
+      stream_timeout: 300
+
+  # ---------------------------------------------------------------------------
+  # Provider aliases for smoke tests and targeted debugging
+  # ---------------------------------------------------------------------------
+
+  - model_name: google_free
+    litellm_params:
+      model: gemini/gemini-2.5-pro
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: google_free
+    litellm_params:
+      model: gemini/gemini-2.5-flash
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: google_free
+    litellm_params:
+      model: gemini/gemini-2.5-flash-lite
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: google_free
+    litellm_params:
+      model: gemini/gemma-3-27b-it
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: google_free
+    litellm_params:
+      model: gemini/gemma-3n-e4b-it
+      api_key: os.environ/GEMINI_API_KEY
+
+  - model_name: cerebras_free
+    litellm_params:
+      model: cerebras/qwen-3-235b-a22b-instruct-2507
+      api_key: os.environ/CEREBRAS_API_KEY
+  - model_name: cerebras_free
+    litellm_params:
+      model: cerebras/llama3.1-8b
+      api_key: os.environ/CEREBRAS_API_KEY
+
+  - model_name: github_free
+    litellm_params:
+      model: github/DeepSeek-R1
+      api_key: os.environ/GITHUB_TOKEN
+  - model_name: github_free
+    litellm_params:
+      model: github/gpt-4.1
+      api_key: os.environ/GITHUB_TOKEN
+  - model_name: github_free
+    litellm_params:
+      model: github/gpt-4o
+      api_key: os.environ/GITHUB_TOKEN
+  - model_name: github_free
+    litellm_params:
+      model: github/Llama-4-Maverick-17B-128E-Instruct-FP8
+      api_key: os.environ/GITHUB_TOKEN
+  - model_name: github_free
+    litellm_params:
+      model: github/Phi-4-reasoning
+      api_key: os.environ/GITHUB_TOKEN
+
+  - model_name: groq_free
+    litellm_params:
+      model: groq/llama-3.3-70b-versatile
+      api_key: os.environ/GROQ_API_KEY
+  - model_name: groq_free
+    litellm_params:
+      model: groq/llama-3.1-8b-instant
+      api_key: os.environ/GROQ_API_KEY
+  - model_name: groq_free
+    litellm_params:
+      model: groq/openai/gpt-oss-20b
+      api_key: os.environ/GROQ_API_KEY
+  - model_name: groq_free
+    litellm_params:
+      model: groq/qwen/qwen3-32b
+      api_key: os.environ/GROQ_API_KEY
+
+  - model_name: mistral_free
+    litellm_params:
+      model: mistral/mistral-small-latest
+      api_key: os.environ/MISTRAL_API_KEY
+  - model_name: mistral_free
+    litellm_params:
+      model: mistral/codestral-latest
+      api_key: os.environ/MISTRAL_API_KEY
+  - model_name: mistral_free
+    litellm_params:
+      model: mistral/devstral-small-latest
+      api_key: os.environ/MISTRAL_API_KEY
+  - model_name: mistral_free
+    litellm_params:
+      model: mistral/pixtral-large-latest
+      api_key: os.environ/MISTRAL_API_KEY
+
+  - model_name: nvidia_free
+    litellm_params:
+      model: nvidia_nim/meta/llama-3.3-70b-instruct
+      api_key: os.environ/NVIDIA_NIM_API_KEY
+  - model_name: nvidia_free
+    litellm_params:
+      model: nvidia_nim/google/gemma-3-27b-it
+      api_key: os.environ/NVIDIA_NIM_API_KEY
+  - model_name: nvidia_free
+    litellm_params:
+      model: nvidia_nim/openai/gpt-oss-120b
+      api_key: os.environ/NVIDIA_NIM_API_KEY
+  - model_name: nvidia_free
+    litellm_params:
+      model: nvidia_nim/nvidia/llama-3.1-nemotron-ultra-253b-v1
+      api_key: os.environ/NVIDIA_NIM_API_KEY
+
+  - model_name: cloudflare_free
+    litellm_params:
+      model: cloudflare/@cf/meta/llama-3.3-70b-instruct-fp8-fast
+      api_key: os.environ/CLOUDFLARE_API_TOKEN
+  - model_name: cloudflare_free
+    litellm_params:
+      model: cloudflare/@cf/openai/gpt-oss-120b
+      api_key: os.environ/CLOUDFLARE_API_TOKEN
+  - model_name: cloudflare_free
+    litellm_params:
+      model: cloudflare/@cf/qwen/qwen2.5-coder-32b-instruct
+      api_key: os.environ/CLOUDFLARE_API_TOKEN
+  - model_name: cloudflare_free
+    litellm_params:
+      model: cloudflare/@cf/deepseek-ai/deepseek-r1-distill-qwen-32b
+      api_key: os.environ/CLOUDFLARE_API_TOKEN
+  - model_name: cloudflare_free
+    litellm_params:
+      model: cloudflare/@cf/zai-org/glm-4.7-flash
+      api_key: os.environ/CLOUDFLARE_API_TOKEN
+
+  - model_name: cohere_free
+    litellm_params:
+      model: cohere/command-r-08-2024
+      api_key: os.environ/COHERE_API_KEY
+  - model_name: cohere_free
+    litellm_params:
+      model: cohere/command-a-reasoning-08-2025
+      api_key: os.environ/COHERE_API_KEY
+  - model_name: cohere_free
+    litellm_params:
+      model: cohere/c4ai-aya-expanse-32b
+      api_key: os.environ/COHERE_API_KEY
+  - model_name: cohere_free
+    litellm_params:
+      model: cohere/command-a-vision-07-2025
+      api_key: os.environ/COHERE_API_KEY
+
+  - model_name: openrouter_free
+    litellm_params:
+      model: openrouter/meta-llama/llama-3.3-70b-instruct:free
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: openrouter_free
+    litellm_params:
+      model: openrouter/openai/gpt-oss-120b:free
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: openrouter_free
+    litellm_params:
+      model: openrouter/qwen/qwen3-coder:free
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: openrouter_free
+    litellm_params:
+      model: openrouter/stepfun/step-3.5-flash:free
+      api_key: os.environ/OPENROUTER_API_KEY
+
+router_settings:
+  routing_strategy: latency-based-routing
+  num_retries: 6
+  retry_after: 1
+  allowed_fails: 1
+  cooldown_time: 15
+  timeout: 35
+  stream_timeout: 90
+  cache_responses: true
+  enable_pre_call_checks: true
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  json_logs: true
+
+litellm_settings:
+  drop_params: true
+  set_verbose: false
+  cache: true
+  cache_params:
+    type: redis
+    host: os.environ/REDIS_HOST
+    port: os.environ/REDIS_PORT
+    ttl: 18000
