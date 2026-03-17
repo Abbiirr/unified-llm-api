@@ -1,0 +1,289 @@
+# =============================================================================
+# LiteLLM Unified Free LLM Gateway — v2 (updated from cheahjs/free-llm-api-resources)
+# =============================================================================
+# 9 permanently free providers + Ollama local. No trial credits, no expiration.
+# Priority: Local → Google → Cerebras → Groq → GitHub Models → Mistral →
+#           NVIDIA NIM → Cloudflare → OpenRouter → Cohere
+#
+# Accounts needed: 9 signups + existing GitHub = 10 total (see .env.template)
+# Cost: $0 forever on permanent tiers, trial credits are bonus
+# =============================================================================
+
+model_list:
+
+  # ===================== TIER 0: LOCAL OLLAMA (unlimited, your hardware) =====================
+  - model_name: default
+    litellm_params:
+      model: ollama/glm-4.7-flash
+      api_base: http://host.docker.internal:11434
+      timeout: 30
+      stream_timeout: 60
+
+  # ===================== TIER 1: GOOGLE AI STUDIO ==========================================
+  # Best free tier overall. Gemini 3/2.5 Flash = 20 req/day each, Gemma = 14,400/day
+  - model_name: default
+    litellm_params:
+      model: gemini/gemini-3-flash
+      api_key: os.environ/GEMINI_API_KEY
+
+  - model_name: default
+    litellm_params:
+      model: gemini/gemini-2.5-flash-lite
+      api_key: os.environ/GEMINI_API_KEY
+
+  - model_name: default
+    litellm_params:
+      model: gemini/gemini-2.5-flash
+      api_key: os.environ/GEMINI_API_KEY
+
+  # Gemma models: 14,400 req/day, 30 RPM — excellent as workhorse fallbacks
+  - model_name: default
+    litellm_params:
+      model: gemini/gemma-3-27b-it
+      api_key: os.environ/GEMINI_API_KEY
+
+  # ===================== TIER 2: CEREBRAS (blazing fast, great limits) ======================
+  # 30 RPM, 900 req/hr, 14,400 req/day per model
+  - model_name: default
+    litellm_params:
+      model: cerebras/llama-3.3-70b
+      api_key: os.environ/CEREBRAS_API_KEY
+
+  - model_name: default
+    litellm_params:
+      model: cerebras/qwen-3-32b
+      api_key: os.environ/CEREBRAS_API_KEY
+
+  - model_name: default
+    litellm_params:
+      model: cerebras/qwen-3-235b-a22b
+      api_key: os.environ/CEREBRAS_API_KEY
+
+  - model_name: default
+    litellm_params:
+      model: cerebras/gpt-oss-120b
+      api_key: os.environ/CEREBRAS_API_KEY
+
+  # ===================== TIER 3: GROQ (fast inference, many models) =========================
+  # 1K-14.4K req/day per model, 6K-30K tok/min
+  - model_name: default
+    litellm_params:
+      model: groq/llama-3.3-70b-versatile
+      api_key: os.environ/GROQ_API_KEY
+
+  - model_name: default
+    litellm_params:
+      model: groq/llama-3.1-8b-instant
+      api_key: os.environ/GROQ_API_KEY
+
+  - model_name: default
+    litellm_params:
+      model: groq/llama-4-scout-17b-16e-instruct
+      api_key: os.environ/GROQ_API_KEY
+
+  - model_name: default
+    litellm_params:
+      model: groq/moonshotai/kimi-k2-instruct
+      api_key: os.environ/GROQ_API_KEY
+
+  - model_name: default
+    litellm_params:
+      model: groq/openai/gpt-oss-120b
+      api_key: os.environ/GROQ_API_KEY
+
+  - model_name: default
+    litellm_params:
+      model: groq/qwen/qwen3-32b
+      api_key: os.environ/GROQ_API_KEY
+
+  # ===================== TIER 4: GITHUB MODELS (free with GitHub account) ===================
+  # Limits depend on Copilot tier (Free tier available). Restrictive token limits.
+  # Uses OpenAI-compatible endpoint at https://models.inference.ai.azure.com
+  - model_name: default
+    litellm_params:
+      model: github/gpt-5-nano
+      api_key: os.environ/GITHUB_TOKEN
+
+  - model_name: default
+    litellm_params:
+      model: github/deepseek-r1-0528
+      api_key: os.environ/GITHUB_TOKEN
+
+  - model_name: default
+    litellm_params:
+      model: github/llama-3.3-70b-instruct
+      api_key: os.environ/GITHUB_TOKEN
+
+  - model_name: default
+    litellm_params:
+      model: github/mistral-small-3.1
+      api_key: os.environ/GITHUB_TOKEN
+
+  # ===================== TIER 5: MISTRAL (enormous monthly allowance) =======================
+  # 1 RPS, 500K tok/min, 1B tok/month — Experiment plan (data used for training)
+  - model_name: default
+    litellm_params:
+      model: mistral/mistral-small-latest
+      api_key: os.environ/MISTRAL_API_KEY
+
+  - model_name: default
+    litellm_params:
+      model: mistral/codestral-latest
+      api_key: os.environ/MISTRAL_API_KEY
+
+  # ===================== TIER 6: NVIDIA NIM (40 RPM, phone verification) ====================
+  - model_name: default
+    litellm_params:
+      model: nvidia_nim/meta/llama-3.3-70b-instruct
+      api_key: os.environ/NVIDIA_NIM_API_KEY
+
+  # ===================== TIER 7: CLOUDFLARE WORKERS AI (10K neurons/day) ====================
+  - model_name: default
+    litellm_params:
+      model: cloudflare/@cf/meta/llama-3.3-70b-instruct-fp8-fast
+      api_key: os.environ/CLOUDFLARE_API_TOKEN
+      api_base: https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1
+
+  # ===================== TIER 8: OPENROUTER FREE MODELS (50 req/day shared) =================
+  - model_name: default
+    litellm_params:
+      model: openrouter/meta-llama/llama-3.3-70b-instruct:free
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  - model_name: default
+    litellm_params:
+      model: openrouter/deepseek/deepseek-r1-0528:free
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  - model_name: default
+    litellm_params:
+      model: openrouter/qwen/qwen3-coder:free
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  - model_name: default
+    litellm_params:
+      model: openrouter/openai/gpt-oss-120b:free
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  - model_name: default
+    litellm_params:
+      model: openrouter/moonshotai/kimi-k2:free
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  - model_name: default
+    litellm_params:
+      model: openrouter/mistralai/mistral-small-3.1-24b-instruct:free
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  # ===================== TIER 9: COHERE (1K req/month emergency) ============================
+  - model_name: default
+    litellm_params:
+      model: cohere/command-a-03-2025
+      api_key: os.environ/COHERE_API_KEY
+
+  - model_name: default
+    litellm_params:
+      model: cohere/command-a-reasoning-08-2025
+      api_key: os.environ/COHERE_API_KEY
+
+
+  # ===================== NAMED ALIASES ======================================================
+
+  # "fast" — lowest latency providers
+  - model_name: fast
+    litellm_params:
+      model: cerebras/llama-3.3-70b
+      api_key: os.environ/CEREBRAS_API_KEY
+  - model_name: fast
+    litellm_params:
+      model: groq/llama-3.1-8b-instant
+      api_key: os.environ/GROQ_API_KEY
+
+  # "smart" — best reasoning models available free
+  - model_name: smart
+    litellm_params:
+      model: gemini/gemini-3-flash
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: smart
+    litellm_params:
+      model: gemini/gemini-2.5-flash
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: smart
+    litellm_params:
+      model: groq/moonshotai/kimi-k2-instruct
+      api_key: os.environ/GROQ_API_KEY
+  - model_name: smart
+    litellm_params:
+      model: cohere/command-a-reasoning-08-2025
+      api_key: os.environ/COHERE_API_KEY
+  - model_name: smart
+    litellm_params:
+      model: openrouter/deepseek/deepseek-r1-0528:free
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  # "coding" — best for code tasks
+  - model_name: coding
+    litellm_params:
+      model: mistral/codestral-latest
+      api_key: os.environ/MISTRAL_API_KEY
+  - model_name: coding
+    litellm_params:
+      model: cerebras/qwen-3-32b
+      api_key: os.environ/CEREBRAS_API_KEY
+  - model_name: coding
+    litellm_params:
+      model: openrouter/qwen/qwen3-coder:free
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  # "big" — largest parameter models available free
+  - model_name: big
+    litellm_params:
+      model: cerebras/qwen-3-235b-a22b
+      api_key: os.environ/CEREBRAS_API_KEY
+  - model_name: big
+    litellm_params:
+      model: cerebras/gpt-oss-120b
+      api_key: os.environ/CEREBRAS_API_KEY
+  - model_name: big
+    litellm_params:
+      model: openrouter/meta-llama/llama-3.1-405b-instruct:free
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  # "local" — force local only
+  - model_name: local
+    litellm_params:
+      model: ollama/glm-4.7-flash
+      api_base: http://host.docker.internal:11434
+      timeout: 120
+      stream_timeout: 300
+
+
+# =============================================================================
+# ROUTER SETTINGS
+# =============================================================================
+router_settings:
+  routing_strategy: latency-based-routing
+  num_retries: 5            # more providers = more retries worthwhile
+  retry_after: 2
+  allowed_fails: 1
+  cooldown_time: 60
+  timeout: 45
+  stream_timeout: 90
+  cache_responses: true
+  enable_pre_call_checks: true
+
+# =============================================================================
+# GENERAL SETTINGS
+# =============================================================================
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  disable_database: true
+  json_logs: true
+
+litellm_settings:
+  drop_params: true
+  set_verbose: false
+  cache: true
+  cache_params:
+    type: local
+    ttl: 3600

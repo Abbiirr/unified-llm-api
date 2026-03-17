@@ -1,0 +1,45 @@
+version: "3.9"
+
+services:
+  # ── Smart Router (public-facing, :4001) ──
+  # Classifies requests → rewrites model alias → forwards to LiteLLM
+  router:
+    build:
+      context: .
+      dockerfile: Dockerfile.router
+    container_name: llm-router
+    ports:
+      - "4001:4001"
+    environment:
+      - LITELLM_BASE=http://litellm:4000
+    depends_on:
+      litellm:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── LiteLLM Proxy (internal, :4000) ──
+  # Multi-provider gateway with failover, caching, rate-limit handling
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    container_name: llm-gateway
+    # Not exposed to host — only router talks to it
+    # Uncomment below if you want direct LiteLLM access too:
+    # ports:
+    #   - "4000:4000"
+    volumes:
+      - ./litellm_config.yaml:/app/config.yaml
+    env_file:
+      - .env
+    command:
+      - "--config"
+      - "/app/config.yaml"
+      - "--port"
+      - "4000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

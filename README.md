@@ -78,6 +78,13 @@ Identical requests (same alias, messages, parameters) are served from Redis cach
 
 Using `default` for everything works but may waste retries on providers that don't support your request type (e.g., sending images to a text-only model).
 
+### Streaming by default
+
+The gateway defaults to `stream: true` for all requests unless the client explicitly sets `"stream": false`. This means:
+- Thinking models won't timeout on long reasoning chains
+- Clients get faster time-to-first-token
+- To disable, explicitly pass `"stream": false` in your request
+
 ## Model aliases
 
 | Alias | Best for | Top models in this alias |
@@ -195,8 +202,38 @@ Client App  →  localhost:4000 (LiteLLM Proxy)  →  Provider Pool
 | `docker-compose.yaml` | LiteLLM + Redis containers | Yes |
 | `ARCHITECTURE.md` | Routing, caching, failover deep-dive | Yes |
 | `MAINTENANCE.md` | Updating models, health checks | Yes |
+| `smart_router.py` | Smart routing + request normalization | Yes |
+| `gateway_docs.py` | Self-documenting API endpoint | Yes |
 | `scripts/smoke_test_gateway.sh` | Automated provider health check | Yes |
+| `scripts/run_gateway.sh` | Run LiteLLM locally with file logging | Yes |
+| `scripts/run_router.sh` | Run smart router locally with file logging | Yes |
+| `logs/routing_training.jsonl` | ML training data (auto-generated) | No |
 | `docs/` | Original design spec | Yes |
+
+## Training data for ML router
+
+Every request through the smart router is logged to `logs/routing_training.jsonl` in structured JSONL format. Each record contains:
+
+```json
+{
+  "user_text_preview": "Write a Python function...",
+  "user_text_length": 53,
+  "message_count": 1,
+  "has_images": false,
+  "has_tools": false,
+  "has_system_prompt": false,
+  "tool_count": 0,
+  "routed_alias": "coding",
+  "route_reason": "keyword match: 'Python'",
+  "status": 200,
+  "latency_ms": 3525,
+  "prompt_tokens": 18,
+  "completion_tokens": 50,
+  "cache_hit": false
+}
+```
+
+Use this data to train a small ML model to replace the keyword-based router with a learned classifier.
 
 ## Maintenance
 

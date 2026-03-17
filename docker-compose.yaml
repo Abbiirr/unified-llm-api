@@ -1,6 +1,31 @@
 
 
 services:
+  # Smart router — public-facing entry point (port 4001)
+  # Classifies requests and rewrites model alias before forwarding to LiteLLM
+  router:
+    image: python:3.12-slim
+    container_name: llm-router
+    ports:
+      - "4001:4001"
+    volumes:
+      - ./smart_router.py:/app/smart_router.py:ro
+    environment:
+      - LITELLM_BASE=http://litellm:4000
+      - ROUTER_PORT=4001
+      - LOG_LEVEL=INFO
+    command: ["sh", "-c", "pip install -q fastapi uvicorn httpx && python /app/smart_router.py"]
+    depends_on:
+      litellm:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4001/router/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # LiteLLM proxy — internal, not exposed to host directly
   litellm:
     image: ghcr.io/berriai/litellm:main-stable
     container_name: llm-gateway
@@ -37,26 +62,28 @@ services:
       timeout: 10s
       retries: 3
 
+  # API docs — port 4002
   docs:
     image: python:3.12-alpine
     container_name: llm-gateway-docs
     ports:
-      - "4001:4001"
+      - "4002:4002"
     volumes:
       - ./gateway_docs.py:/app/gateway_docs.py:ro
       - ./litellm_config.yaml:/app/config.yaml:ro
     environment:
       - CONFIG_PATH=/app/config.yaml
-      - GATEWAY_URL=http://localhost:4000
-      - DOCS_PORT=4001
+      - GATEWAY_URL=http://localhost:4001
+      - DOCS_PORT=4002
     command: ["sh", "-c", "pip install -q pyyaml && python /app/gateway_docs.py"]
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4001/docs', timeout=3)"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4002/docs', timeout=3)"]
       interval: 30s
       timeout: 5s
       retries: 3
 
+  # Redis cache
   redis:
     image: redis:7-alpine
     container_name: llm-gateway-cache

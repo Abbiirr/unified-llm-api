@@ -19,3 +19,11 @@ Thumbs.db
 
 # Logs
 *.log
+*.jsonl
+logs/
+
+# Python / uv
+__pycache__/
+.venv/
+
+.claude/

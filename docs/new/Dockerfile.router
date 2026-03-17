@@ -1,0 +1,7 @@
+FROM python:3.12-slim
+WORKDIR /app
+RUN pip install --no-cache-dir fastapi uvicorn httpx
+COPY smart_router.py .
+# Replace localhost with docker service name
+ENV LITELLM_BASE=http://litellm:4000
+CMD ["uvicorn", "smart_router:app", "--host", "0.0.0.0", "--port", "4001"]
