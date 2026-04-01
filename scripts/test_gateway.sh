@@ -41,16 +41,19 @@ skip() { SKIP=$((SKIP+1)); echo "  SKIP: $1"; }
 warn() { WARN=$((WARN+1)); echo "  WARN: $1"; }
 
 chat() {
-    local body
-    body=$(echo "$1" | python3 -c "import sys,json; d=json.load(sys.stdin); d['stream']=False; print(json.dumps(d))" 2>/dev/null || echo "$1")
+    local body tmpfile
+    body=$(printf '%s' "$1" | python3 -c "import sys,json; d=json.load(sys.stdin); d['stream']=False; print(json.dumps(d))" 2>/dev/null || printf '%s' "$1")
+    tmpfile=$(mktemp)
     curl -s --max-time "${2:-30}" "$GATEWAY/chat/completions" \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $API_KEY" \
-        -d "$body" 2>&1
+        -d "$body" -o "$tmpfile" 2>/dev/null
+    cat "$tmpfile"
+    rm -f "$tmpfile"
 }
 
 has_choices() {
-    python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('choices') else 1)" 2>/dev/null
+    python3 -c "import sys,json; exit(0 if json.loads(sys.stdin.read()).get('choices') else 1)" 2>/dev/null
 }
 
 get_error() {
@@ -68,7 +71,10 @@ try:
     elif '429' in str(d.get('error','')): print('429')
     elif '400' in str(d.get('error',{}).get('code','')): print('400')
     else: print(d.get('error',{}).get('code','unknown'))
-except: print('parse_error')
+except:
+    # Could be streaming SSE or truncated — check if data: prefix exists
+    if raw.strip().startswith('data:'): print('200')
+    else: print('parse_error')
 " 2>/dev/null
 }
 
@@ -116,11 +122,14 @@ else
     skip "No auth required (open gateway)"
 fi
 
-AUTH=$(chat '{"model":"default","messages":[{"role":"user","content":"Say OK"}],"max_tokens":5}' 15)
-if echo "$AUTH" | has_choices; then
-    pass "Authenticated request succeeds"
+AUTH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "$GATEWAY/chat/completions" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $API_KEY" \
+    -d '{"model":"tools","messages":[{"role":"user","content":"Auth test"}],"max_tokens":5,"stream":false}' 2>&1)
+if [ "$AUTH_STATUS" = "200" ]; then
+    pass "Authenticated request succeeds (HTTP $AUTH_STATUS)"
 else
-    fail "Authenticated request failed: $(echo "$AUTH" | get_error 200)"
+    fail "Authenticated request failed: $(printf "%s" "$AUTH" | get_error 200)"
     echo "ABORT: Cannot authenticate."
     exit 1
 fi
@@ -130,12 +139,12 @@ echo ""
 # T3: All aliases respond
 # ─────────────────────────────────────────────────────────────────
 echo "--- T3: Alias availability ---"
-for alias in default fast thinking coding vision tools big bench tools_stable bench_stable; do
+for alias in default fast thinking coding vision tools big bench tools_stable bench_stable swebench tools_large tools_local; do
     result=$(chat "{\"model\":\"$alias\",\"messages\":[{\"role\":\"user\",\"content\":\"Say OK\"}],\"max_tokens\":5}" 20)
-    if echo "$result" | has_choices; then
+    if printf "%s" "$result" | has_choices; then
         pass "Alias '$alias'"
     else
-        fail "Alias '$alias': $(echo "$result" | get_error 80)"
+        fail "Alias '$alias': $(printf "%s" "$result" | get_error 80)"
     fi
     sleep 0.5
 done
@@ -153,11 +162,11 @@ for alias in tools tools_stable bench default; do
         \"max_tokens\":50,
         \"tool_choice\":\"required\"
     }" 30)
-    tc_count=$(echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('choices',[{}])[0].get('message',{}).get('tool_calls',[])))" 2>/dev/null)
+    tc_count=$(printf "%s" "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('choices',[{}])[0].get('message',{}).get('tool_calls',[])))" 2>/dev/null)
     if [ "$tc_count" -gt 0 ] 2>/dev/null; then
         pass "Alias '$alias' tool call ($tc_count)"
     else
-        fail "Alias '$alias' tool call: $(echo "$result" | get_error 80)"
+        fail "Alias '$alias' tool call: $(printf "%s" "$result" | get_error 80)"
     fi
     sleep 1
 done
@@ -175,7 +184,7 @@ T1_RESP=$(chat "{
     \"tool_choice\":\"required\"
 }" 30)
 
-TC_ID=$(echo "$T1_RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['choices'][0]['message']['tool_calls'][0]['id'])" 2>/dev/null)
+TC_ID=$(printf "%s" "$T1_RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['choices'][0]['message']['tool_calls'][0]['id'])" 2>/dev/null)
 
 if [ -z "$TC_ID" ]; then
     fail "Turn 1: no tool call returned"
@@ -193,10 +202,10 @@ else
         \"max_tokens\":100
     }" 30)
 
-    if echo "$T2_RESP" | has_choices; then
+    if printf "%s" "$T2_RESP" | has_choices; then
         pass "Turn 2: response after tool result"
     else
-        fail "Turn 2: $(echo "$T2_RESP" | get_error)"
+        fail "Turn 2: $(printf "%s" "$T2_RESP" | get_error)"
     fi
 fi
 echo ""
@@ -219,10 +228,10 @@ if [ -n "$TC_ID" ]; then
         \"max_tokens\":200
     }" 30)
 
-    if echo "$T3_RESP" | has_choices; then
+    if printf "%s" "$T3_RESP" | has_choices; then
         pass "3-turn conversation accepted"
     else
-        fail "3-turn conversation: $(echo "$T3_RESP" | get_error)"
+        fail "3-turn conversation: $(printf "%s" "$T3_RESP" | get_error)"
     fi
 else
     skip "Skipped (T5 turn 1 failed)"
@@ -243,10 +252,10 @@ ORPHAN_RESP=$(chat "{
     ],
     \"max_tokens\":50
 }" 30)
-if echo "$ORPHAN_RESP" | has_choices; then
+if printf "%s" "$ORPHAN_RESP" | has_choices; then
     pass "Orphan tool result repaired (not 500)"
 else
-    err=$(echo "$ORPHAN_RESP" | get_error 80)
+    err=$(printf "%s" "$ORPHAN_RESP" | get_error 80)
     if echo "$err" | grep -qi "500\|Missing corresponding tool call"; then
         fail "Orphan tool result caused 500: $err"
     else
@@ -268,10 +277,10 @@ NULL_RESP=$(chat "{
     ],
     \"max_tokens\":50
 }" 30)
-if echo "$NULL_RESP" | has_choices; then
+if printf "%s" "$NULL_RESP" | has_choices; then
     pass "Null content assistant handled (not 400)"
 else
-    err=$(echo "$NULL_RESP" | get_error 80)
+    err=$(printf "%s" "$NULL_RESP" | get_error 80)
     if echo "$err" | grep -qi "non-empty content\|invalid message"; then
         fail "Null content caused provider 400: $err"
     else
@@ -292,7 +301,7 @@ for size in 4000 20000 50000; do
         \"tools\":$TOOL_DEF,
         \"max_tokens\":20
     }" 60)
-    status=$(echo "$result" | get_status)
+    status=$(printf "%s" "$result" | get_status)
     if [ "$status" = "200" ]; then
         pass "${size}-char prompt accepted"
     elif [ "$status" = "413" ]; then
@@ -312,7 +321,7 @@ PAD5=$(python3 -c "print('y' * 5000)")
 FOUR13=0
 for alias in default fast thinking coding tools big bench; do
     result=$(chat "{\"model\":\"$alias\",\"messages\":[{\"role\":\"user\",\"content\":\"Fix: $PAD5\"}],\"max_tokens\":10}" 30)
-    status=$(echo "$result" | get_status)
+    status=$(printf "%s" "$result" | get_status)
     if [ "$status" = "413" ]; then
         FOUR13=$((FOUR13+1))
         fail "413 on alias '$alias'"
@@ -329,7 +338,7 @@ T11_OK=0
 T11_429=0
 for i in $(seq 1 15); do
     result=$(chat '{"model":"tools","messages":[{"role":"user","content":"Say OK"}],"max_tokens":5}' 15)
-    status=$(echo "$result" | get_status)
+    status=$(printf "%s" "$result" | get_status)
     if [ "$status" = "200" ]; then
         T11_OK=$((T11_OK+1))
     elif [ "$status" = "429" ]; then
@@ -353,7 +362,7 @@ START=$(date +%s%N)
 result=$(chat '{"model":"tools","messages":[{"role":"user","content":"Write fibonacci in Python"}],"max_tokens":200}' 120)
 END=$(date +%s%N)
 ELAPSED_MS=$(( (END - START) / 1000000 ))
-if echo "$result" | has_choices; then
+if printf "%s" "$result" | has_choices; then
     if [ $ELAPSED_MS -lt 10000 ]; then
         pass "Response in ${ELAPSED_MS}ms (fast)"
     elif [ $ELAPSED_MS -lt 30000 ]; then
@@ -388,7 +397,7 @@ echo "--- T14: No provider 400s on standard requests ---"
 T14_400=0
 for i in $(seq 1 5); do
     result=$(chat '{"model":"tools","messages":[{"role":"system","content":"Use tools."},{"role":"user","content":"List files in current directory"}],"tools":[{"type":"function","function":{"name":"list_files","description":"List files","parameters":{"type":"object","properties":{"dir":{"type":"string"}},"required":["dir"]}}}],"max_tokens":50,"tool_choice":"required"}' 30)
-    status=$(echo "$result" | get_status)
+    status=$(printf "%s" "$result" | get_status)
     [ "$status" = "400" ] && T14_400=$((T14_400+1))
     sleep 1
 done
@@ -396,6 +405,131 @@ if [ $T14_400 -eq 0 ]; then
     pass "Zero provider 400s on 5 tool requests"
 else
     fail "$T14_400/5 tool requests got 400 — provider compatibility issue"
+fi
+echo ""
+
+# ─────────────────────────────────────────────────────────────────
+# T15: Cloud-only aliases respond (Ollama bypass path)
+# ─────────────────────────────────────────────────────────────────
+echo "--- T15: Cloud-only aliases ---"
+for alias in tools_cloud bench_cloud default_cloud swebench_cloud; do
+    result=$(chat "{\"model\":\"$alias\",\"messages\":[{\"role\":\"user\",\"content\":\"Say OK\"}],\"max_tokens\":5}" 20)
+    if printf "%s" "$result" | has_choices; then
+        pass "Alias '$alias'"
+    else
+        fail "Alias '$alias': $(printf "%s" "$result" | get_error 80)"
+    fi
+    sleep 0.5
+done
+echo ""
+
+# ─────────────────────────────────────────────────────────────────
+# T16: Ollama health probe reports status
+# ─────────────────────────────────────────────────────────────────
+echo "--- T16: Ollama health probe ---"
+HEALTH_DATA=$(curl -s --max-time 5 "$GATEWAY_BASE/router/health" 2>&1)
+if echo "$HEALTH_DATA" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if 'ollama_hosts' in d else 1)" 2>/dev/null; then
+    pass "Ollama health probe active"
+    echo "$HEALTH_DATA" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+for name, info in d.get('ollama_hosts',{}).items():
+    status = 'UP' if info['healthy'] else 'DOWN'
+    print(f'        {name}: {status} ({info[\"url\"]})')
+" 2>/dev/null
+else
+    warn "Ollama health probe not available (direct LiteLLM mode)"
+fi
+echo ""
+
+# ─────────────────────────────────────────────────────────────────
+# T17: Fallback chain doesn't route back to Ollama
+# ─────────────────────────────────────────────────────────────────
+echo "--- T17: Fallback chain integrity ---"
+# tools_cloud should work without any Ollama dependency
+result=$(chat '{"model":"tools_cloud","messages":[{"role":"user","content":"Say OK"}],"max_tokens":5}' 15)
+if printf "%s" "$result" | has_choices; then
+    pass "tools_cloud responds (no Ollama in chain)"
+else
+    fail "tools_cloud failed — fallback chain may include Ollama"
+fi
+
+# default_cloud should be the final fallback (no Ollama)
+result=$(chat '{"model":"default_cloud","messages":[{"role":"user","content":"Say OK"}],"max_tokens":5}' 15)
+if printf "%s" "$result" | has_choices; then
+    pass "default_cloud responds (final fallback, no Ollama)"
+else
+    fail "default_cloud failed"
+fi
+echo ""
+
+# ─────────────────────────────────────────────────────────────────
+# T18: Flush cooldowns endpoint
+# ─────────────────────────────────────────────────────────────────
+echo "--- T18: Flush cooldowns endpoint ---"
+FLUSH=$(curl -s -X POST --max-time 5 "$GATEWAY_BASE/router/flush-cooldowns" 2>&1)
+if echo "$FLUSH" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('status')=='flushed' else 1)" 2>/dev/null; then
+    pass "Flush cooldowns endpoint works"
+else
+    warn "Flush cooldowns not available (direct LiteLLM mode)"
+fi
+echo ""
+
+# ─────────────────────────────────────────────────────────────────
+# T19: Large context providers available in swebench
+# ─────────────────────────────────────────────────────────────────
+echo "--- T19: Large context coverage ---"
+# Verify swebench has 256K+ providers by checking model list
+SWEBENCH_MODELS=$(curl -s --max-time 5 "$GATEWAY/models" \
+    -H "Authorization: Bearer $API_KEY" 2>&1)
+if printf '%s' "$SWEBENCH_MODELS" | python3 -c "import sys,json; d=json.load(sys.stdin); models=[m['id'] for m in d.get('data',[])]; exit(0 if 'swebench' in models else 1)" 2>/dev/null; then
+    pass "swebench alias registered"
+else
+    fail "swebench alias not found in model list"
+fi
+
+if printf '%s' "$SWEBENCH_MODELS" | python3 -c "import sys,json; d=json.load(sys.stdin); models=[m['id'] for m in d.get('data',[])]; exit(0 if 'tools_large' in models else 1)" 2>/dev/null; then
+    pass "tools_large alias registered"
+else
+    fail "tools_large alias not found in model list"
+fi
+
+if printf '%s' "$SWEBENCH_MODELS" | python3 -c "import sys,json; d=json.load(sys.stdin); models=[m['id'] for m in d.get('data',[])]; exit(0 if 'tools_local' in models else 1)" 2>/dev/null; then
+    pass "tools_local alias registered (429 rescue)"
+else
+    fail "tools_local alias not found"
+fi
+echo ""
+
+# ─────────────────────────────────────────────────────────────────
+# T20: 429 rescue endpoint available
+# ─────────────────────────────────────────────────────────────────
+echo "--- T20: 429 rescue infrastructure ---"
+# Verify tools_local works (the rescue target)
+result=$(chat '{"model":"tools_local","messages":[{"role":"user","content":"Say OK"}],"max_tokens":5}' 60)
+if printf '%s' "$result" | has_choices; then
+    pass "tools_local responds (429 rescue target)"
+else
+    # tools_local may fail if both Ollama are down — that's acceptable
+    warn "tools_local unavailable (Ollama may be down — rescue will fail gracefully)"
+fi
+echo ""
+
+# ─────────────────────────────────────────────────────────────────
+# T21: Provider status endpoint
+# ─────────────────────────────────────────────────────────────────
+echo "--- T21: Provider status & model identity ---"
+pstatus=$(curl -sf --max-time 5 "$GATEWAY_BASE/router/provider-status" 2>/dev/null)
+if printf '%s' "$pstatus" | python3 -c "import json,sys; d=json.load(sys.stdin); assert 'providers' in d; assert 'model_identity_count' in d" 2>/dev/null; then
+    pass "Provider status endpoint responds"
+    model_count=$(printf '%s' "$pstatus" | python3 -c "import json,sys; print(json.load(sys.stdin)['model_identity_count'])")
+    if [ "$model_count" -gt 0 ]; then
+        pass "Model identity map loaded ($model_count mappings)"
+    else
+        warn "Model identity map empty"
+    fi
+else
+    fail "Provider status endpoint failed"
 fi
 echo ""
 

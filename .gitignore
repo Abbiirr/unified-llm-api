@@ -27,3 +27,7 @@ __pycache__/
 .venv/
 
 .claude/
+
+# PID files
+*.pid
+.*.pid

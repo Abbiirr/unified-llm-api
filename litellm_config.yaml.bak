@@ -88,6 +88,22 @@ model_list:
     max_input_tokens: 32768
 - model_name: thinking
   litellm_params:
+    model: github/DeepSeek-R1
+    api_key: os.environ/GITHUB_TOKEN
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 4000
+- model_name: thinking
+  litellm_params:
+    model: github/Phi-4-reasoning
+    api_key: os.environ/GITHUB_TOKEN
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 8000
+- model_name: thinking
+  litellm_params:
     model: cohere/command-a-reasoning-08-2025
     api_key: os.environ/COHERE_API_KEY
     order: 1
@@ -104,7 +120,23 @@ model_list:
     max_input_tokens: 131072
 - model_name: coding
   litellm_params:
-    model: mistral/devstral-latest
+    model: github/gpt-4.1
+    api_key: os.environ/GITHUB_TOKEN
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 8000
+- model_name: coding
+  litellm_params:
+    model: github/DeepSeek-R1
+    api_key: os.environ/GITHUB_TOKEN
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 4000
+- model_name: coding
+  litellm_params:
+    model: mistral/devstral-small-latest
     api_key: os.environ/MISTRAL_API_KEY
     order: 1
     cooldown_time: 60
@@ -136,7 +168,7 @@ model_list:
     max_input_tokens: 65536
 - model_name: coding
   litellm_params:
-    model: openrouter/qwen/qwen3-coder:free
+    model: openrouter/qwen/qwen3-coder-480b:free
     api_key: os.environ/OPENROUTER_API_KEY
     order: 2
     cooldown_time: 60
@@ -161,6 +193,14 @@ model_list:
 - model_name: vision
   litellm_params:
     model: github/gpt-4o
+    api_key: os.environ/GITHUB_TOKEN
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 8000
+- model_name: vision
+  litellm_params:
+    model: github/gpt-4.1
     api_key: os.environ/GITHUB_TOKEN
     order: 1
     cooldown_time: 60
@@ -280,7 +320,39 @@ model_list:
     max_input_tokens: 8192
 - model_name: github_free
   litellm_params:
+    model: github/DeepSeek-R1
+    api_key: os.environ/GITHUB_TOKEN
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 4000
+- model_name: github_free
+  litellm_params:
+    model: github/gpt-4.1
+    api_key: os.environ/GITHUB_TOKEN
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 8000
+- model_name: github_free
+  litellm_params:
     model: github/gpt-4o
+    api_key: os.environ/GITHUB_TOKEN
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 8000
+- model_name: github_free
+  litellm_params:
+    model: github/Llama-4-Maverick-17B-128E-Instruct-FP8
+    api_key: os.environ/GITHUB_TOKEN
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 8000
+- model_name: github_free
+  litellm_params:
+    model: github/Phi-4-reasoning
     api_key: os.environ/GITHUB_TOKEN
     order: 1
     cooldown_time: 60
@@ -352,7 +424,7 @@ model_list:
     max_input_tokens: 256000
 - model_name: mistral_free
   litellm_params:
-    model: mistral/devstral-latest
+    model: mistral/devstral-small-latest
     api_key: os.environ/MISTRAL_API_KEY
     order: 1
     cooldown_time: 60
@@ -504,7 +576,15 @@ model_list:
     max_input_tokens: 256000
 - model_name: openrouter_free
   litellm_params:
-    model: openrouter/nvidia/nemotron-3-super-120b-a12b:free
+    model: openrouter/qwen/qwen3-coder-480b:free
+    api_key: os.environ/OPENROUTER_API_KEY
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 262144
+- model_name: openrouter_free
+  litellm_params:
+    model: openrouter/nvidia/nemotron-3-super:free
     api_key: os.environ/OPENROUTER_API_KEY
     order: 1
     cooldown_time: 60
@@ -760,7 +840,39 @@ model_list:
     max_input_tokens: 65536
 - model_name: default
   litellm_params:
+    model: github/DeepSeek-R1
+    api_key: os.environ/GITHUB_TOKEN
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 4000
+- model_name: default
+  litellm_params:
+    model: github/gpt-4.1
+    api_key: os.environ/GITHUB_TOKEN
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 8000
+- model_name: default
+  litellm_params:
     model: github/gpt-4o
+    api_key: os.environ/GITHUB_TOKEN
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 8000
+- model_name: default
+  litellm_params:
+    model: github/Llama-4-Maverick-17B-128E-Instruct-FP8
+    api_key: os.environ/GITHUB_TOKEN
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 8000
+- model_name: default
+  litellm_params:
+    model: github/Llama-3.3-70B-Instruct
     api_key: os.environ/GITHUB_TOKEN
     order: 1
     cooldown_time: 60
@@ -793,6 +905,14 @@ model_list:
 - model_name: default
   litellm_params:
     model: github/gpt-4o-mini
+    api_key: os.environ/GITHUB_TOKEN
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 8000
+- model_name: default
+  litellm_params:
+    model: github/gpt-5-mini
     api_key: os.environ/GITHUB_TOKEN
     order: 1
     cooldown_time: 60
@@ -1032,7 +1152,39 @@ model_list:
     max_input_tokens: 65536
 - model_name: default_cloud
   litellm_params:
+    model: github/DeepSeek-R1
+    api_key: os.environ/GITHUB_TOKEN
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 4000
+- model_name: default_cloud
+  litellm_params:
+    model: github/gpt-4.1
+    api_key: os.environ/GITHUB_TOKEN
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 8000
+- model_name: default_cloud
+  litellm_params:
     model: github/gpt-4o
+    api_key: os.environ/GITHUB_TOKEN
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 8000
+- model_name: default_cloud
+  litellm_params:
+    model: github/Llama-4-Maverick-17B-128E-Instruct-FP8
+    api_key: os.environ/GITHUB_TOKEN
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 8000
+- model_name: default_cloud
+  litellm_params:
+    model: github/Llama-3.3-70B-Instruct
     api_key: os.environ/GITHUB_TOKEN
     order: 1
     cooldown_time: 60
@@ -1065,6 +1217,14 @@ model_list:
 - model_name: default_cloud
   litellm_params:
     model: github/gpt-4o-mini
+    api_key: os.environ/GITHUB_TOKEN
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 8000
+- model_name: default_cloud
+  litellm_params:
+    model: github/gpt-5-mini
     api_key: os.environ/GITHUB_TOKEN
     order: 1
     cooldown_time: 60
@@ -1256,7 +1416,23 @@ model_list:
     max_input_tokens: 1048576
 - model_name: coding_cloud
   litellm_params:
-    model: mistral/devstral-latest
+    model: github/gpt-4.1
+    api_key: os.environ/GITHUB_TOKEN
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 8000
+- model_name: coding_cloud
+  litellm_params:
+    model: github/DeepSeek-R1
+    api_key: os.environ/GITHUB_TOKEN
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 4000
+- model_name: coding_cloud
+  litellm_params:
+    model: mistral/devstral-small-latest
     api_key: os.environ/MISTRAL_API_KEY
     order: 1
     cooldown_time: 60
@@ -1352,6 +1528,22 @@ model_list:
     max_input_tokens: 32768
 - model_name: thinking_cloud
   litellm_params:
+    model: github/DeepSeek-R1
+    api_key: os.environ/GITHUB_TOKEN
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 4000
+- model_name: thinking_cloud
+  litellm_params:
+    model: github/Phi-4-reasoning
+    api_key: os.environ/GITHUB_TOKEN
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 8000
+- model_name: thinking_cloud
+  litellm_params:
     model: cohere/command-a-reasoning-08-2025
     api_key: os.environ/COHERE_API_KEY
     order: 1
@@ -1408,6 +1600,28 @@ model_list:
     cooldown_time: 60
   model_info:
     max_input_tokens: 128000
+- model_name: thinking
+  litellm_params:
+    model: openai/gurubot/jackrong-qwen3.5-claude-reasoning
+    api_base: os.environ/OLLAMA_HOST_1_V1
+    api_key: fake-key
+    timeout: 120
+    stream_timeout: 300
+    order: 50
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 262144
+- model_name: coding
+  litellm_params:
+    model: openai/gurubot/jackrong-qwen3.5-claude-reasoning
+    api_base: os.environ/OLLAMA_HOST_1_V1
+    api_key: fake-key
+    timeout: 120
+    stream_timeout: 300
+    order: 50
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 262144
 - model_name: local
   litellm_params:
     model: ollama/glm-4.7-flash
@@ -1418,7 +1632,67 @@ model_list:
     cooldown_time: 60
   model_info:
     max_input_tokens: 128000
+- model_name: default
+  litellm_params:
+    model: ollama/qwen3.5:9b
+    api_base: os.environ/OLLAMA_HOST_1
+    timeout: 10
+    stream_timeout: 20
+    order: 50
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 262144
+- model_name: bench
+  litellm_params:
+    model: ollama/qwen3.5:9b
+    api_base: os.environ/OLLAMA_HOST_1
+    timeout: 10
+    stream_timeout: 20
+    order: 50
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 262144
+- model_name: bench_stable
+  litellm_params:
+    model: ollama/qwen3.5:9b
+    api_base: os.environ/OLLAMA_HOST_1
+    timeout: 10
+    stream_timeout: 20
+    order: 50
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 262144
+- model_name: coding
+  litellm_params:
+    model: ollama/qwen3.5:9b
+    api_base: os.environ/OLLAMA_HOST_1
+    timeout: 10
+    stream_timeout: 20
+    order: 50
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 262144
+- model_name: thinking
+  litellm_params:
+    model: ollama/qwen3.5:9b
+    api_base: os.environ/OLLAMA_HOST_1
+    timeout: 10
+    stream_timeout: 20
+    order: 50
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 262144
 - model_name: fast
+  litellm_params:
+    model: ollama/qwen3.5:9b
+    api_base: os.environ/OLLAMA_HOST_1
+    timeout: 10
+    stream_timeout: 20
+    order: 50
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 262144
+- model_name: local
   litellm_params:
     model: ollama/qwen3.5:9b
     api_base: os.environ/OLLAMA_HOST_1
@@ -1430,10 +1704,31 @@ model_list:
     max_input_tokens: 262144
 - model_name: tools_local
   litellm_params:
+    model: openai/gurubot/jackrong-qwen3.5-claude-reasoning
+    api_base: os.environ/OLLAMA_HOST_1_V1
+    api_key: fake-key
+    timeout: 120
+    stream_timeout: 300
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 262144
+- model_name: tools_local
+  litellm_params:
     model: ollama/qwen3.5:9b
     api_base: os.environ/OLLAMA_HOST_1
     timeout: 10
     stream_timeout: 20
+    order: 2
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 262144
+- model_name: tools_local
+  litellm_params:
+    model: ollama/qwen3.5:9b
+    api_base: os.environ/OLLAMA_HOST_2
+    timeout: 300
+    stream_timeout: 600
     order: 2
     cooldown_time: 60
   model_info:
@@ -1456,6 +1751,17 @@ model_list:
     max_input_tokens: 128000
 - model_name: swebench
   litellm_params:
+    model: openai/gurubot/jackrong-qwen3.5-claude-reasoning
+    api_base: os.environ/OLLAMA_HOST_1_V1
+    api_key: fake-key
+    timeout: 300
+    stream_timeout: 600
+    order: 50
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 262144
+- model_name: swebench
+  litellm_params:
     model: openai/qwen3.5-claude-262k
     api_base: os.environ/OLLAMA_HOST_1_V1
     api_key: fake-key
@@ -1475,6 +1781,27 @@ model_list:
     cooldown_time: 60
   model_info:
     max_input_tokens: 262144
+- model_name: swebench
+  litellm_params:
+    model: ollama/qwen3.5:9b
+    api_base: os.environ/OLLAMA_HOST_2
+    timeout: 300
+    stream_timeout: 600
+    order: 99
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 262144
+- model_name: tools_large
+  litellm_params:
+    model: openai/gurubot/jackrong-qwen3.5-claude-reasoning
+    api_base: os.environ/OLLAMA_HOST_1_V1
+    api_key: fake-key
+    timeout: 300
+    stream_timeout: 600
+    order: 50
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 262144
 - model_name: tools_large
   litellm_params:
     model: openai/qwen3.5-claude-262k
@@ -1492,6 +1819,16 @@ model_list:
     api_base: os.environ/OLLAMA_HOST_1
     timeout: 10
     stream_timeout: 20
+    order: 99
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 262144
+- model_name: tools_large
+  litellm_params:
+    model: ollama/qwen3.5:9b
+    api_base: os.environ/OLLAMA_HOST_2
+    timeout: 300
+    stream_timeout: 600
     order: 99
     cooldown_time: 60
   model_info:

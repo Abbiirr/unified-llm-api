@@ -99,15 +99,166 @@ _training_logger.setLevel(logging.INFO)
 _training_logger.addHandler(_training_handler)
 _training_logger.propagate = False
 
+# Full conversation logs — for LLM fine-tuning / distillation
+# Stores complete request + response pairs for successful tool-calling conversations
+os.makedirs(f"{LOG_DIR}/training/conversations", exist_ok=True)
+_convo_handler = logging.handlers.RotatingFileHandler(
+    f"{LOG_DIR}/training/conversations/convos.jsonl",
+    maxBytes=200 * 1024 * 1024,  # 200MB per file
+    backupCount=10,              # 2GB total
+    encoding="utf-8",
+)
+_convo_handler.setFormatter(logging.Formatter("%(message)s"))
+_convo_logger = logging.getLogger("conversation_data")
+_convo_logger.setLevel(logging.INFO)
+_convo_logger.addHandler(_convo_handler)
+_convo_logger.propagate = False
+
+
+def log_conversation(sample: dict):
+    """Log full request+response conversation for LLM fine-tuning."""
+    try:
+        _convo_logger.info(json.dumps(sample, default=str))
+    except Exception as e:
+        log.warning("Failed to write conversation log: %s", e)
+
+
+def _categorize_error(status: int, error_msg: str) -> str:
+    """Categorize errors for ML training — provider failure mode learning."""
+    if status == 200:
+        return "success"
+    if status == 429:
+        return "rate_limit"
+    if "ContextWindow" in error_msg:
+        return "context_window"
+    if "schema" in error_msg.lower() or "properties" in error_msg.lower():
+        return "schema_validation"
+    if status == 401 or status == 403:
+        return "auth"
+    if status == 413:
+        return "body_too_large"
+    if status == 500:
+        return "provider_internal"
+    if status == 504:
+        return "timeout"
+    return f"error_{status}"
+
 
 def log_training_sample(sample: dict):
     """Append a structured JSONL record for future ML router training."""
-    sample["timestamp"] = datetime.datetime.utcnow().isoformat() + "Z"
+    now = datetime.datetime.utcnow()
+    sample["timestamp"] = now.isoformat() + "Z"
     sample["id"] = uuid.uuid4().hex[:12]
+    # Error categorization
+    sample["error_category"] = _categorize_error(
+        sample.get("status", 200), sample.get("error_msg", "")
+    )
+    # Time features — critical for learning rate-limit patterns
+    sample["hour_utc"] = now.hour
+    sample["minute_utc"] = now.minute
+    sample["day_of_week"] = now.weekday()  # 0=Monday
+    # Clean provider name from URL
+    pb = sample.get("provider_base", "")
+    if "cerebras" in pb: sample["provider"] = "cerebras"
+    elif "groq" in pb: sample["provider"] = "groq"
+    elif "nvidia" in pb: sample["provider"] = "nvidia"
+    elif "gemini" in pb or "generativelanguage" in pb: sample["provider"] = "gemini"
+    elif "github" in pb or "azure" in pb: sample["provider"] = "github"
+    elif "mistral" in pb: sample["provider"] = "mistral"
+    elif "openrouter" in pb: sample["provider"] = "openrouter"
+    elif "cohere" in pb: sample["provider"] = "cohere"
+    elif "cloudflare" in pb: sample["provider"] = "cloudflare"
+    elif "10.112.30.10" in pb or "192.168.0.73" in pb: sample["provider"] = "ollama"
+    else: sample["provider"] = "unknown"
+    # Rolling provider health stats
+    provider_name = sample["provider"]
+    if provider_name != "unknown":
+        stats = _get_provider_stats(provider_name)
+        sample["provider_recent_error_rate"] = stats["error_rate"]
+        sample["provider_recent_avg_latency_ms"] = stats["avg_latency"]
+        sample["provider_recent_request_count"] = stats["count"]
     try:
         _training_logger.info(json.dumps(sample, default=str))
     except Exception as e:
         log.warning("Failed to write training log: %s", e)
+    # Update provider stats after logging
+    _record_provider_outcome(sample.get("provider", ""), sample.get("status", 0), sample.get("latency_ms", 0))
+
+
+# ── Rolling provider health stats (last 5 minutes) ──
+_provider_history: dict[str, list[tuple[float, int, int]]] = {}  # provider → [(timestamp, status, latency_ms)]
+_PROVIDER_STATS_WINDOW = 300  # 5 minutes
+
+
+def _record_provider_outcome(provider: str, status: int, latency_ms: int):
+    """Record a provider outcome for rolling stats."""
+    if not provider or provider == "unknown":
+        return
+    now = time.monotonic()
+    _provider_history.setdefault(provider, []).append((now, status, latency_ms))
+    # Prune old entries
+    cutoff = now - _PROVIDER_STATS_WINDOW
+    _provider_history[provider] = [(t, s, l) for t, s, l in _provider_history[provider] if t > cutoff]
+
+
+def _get_provider_stats(provider: str) -> dict:
+    """Get rolling stats for a provider over the last 5 minutes."""
+    now = time.monotonic()
+    cutoff = now - _PROVIDER_STATS_WINDOW
+    entries = [(t, s, l) for t, s, l in _provider_history.get(provider, []) if t > cutoff]
+    if not entries:
+        return {"error_rate": 0.0, "avg_latency": 0, "count": 0}
+    errors = sum(1 for _, s, _ in entries if s >= 400)
+    avg_lat = sum(l for _, _, l in entries) // len(entries)
+    return {"error_rate": round(errors / len(entries), 3), "avg_latency": avg_lat, "count": len(entries)}
+
+
+def get_circuit_broken_providers() -> list[str]:
+    """Return list of providers whose error rate exceeds the circuit breaker threshold."""
+    broken = []
+    now = time.monotonic()
+    cutoff = now - _PROVIDER_STATS_WINDOW
+    for provider, history in _provider_history.items():
+        entries = [(t, s, l) for t, s, l in history if t > cutoff]
+        if len(entries) < CIRCUIT_BREAKER_MIN_REQUESTS:
+            continue
+        errors = sum(1 for _, s, _ in entries if s >= 400)
+        error_rate = errors / len(entries)
+        if error_rate >= CIRCUIT_BREAKER_THRESHOLD:
+            broken.append(provider)
+    return broken
+
+
+# ── Model identity resolver ──
+# Maps opaque model ID hashes from LiteLLM to readable model names.
+# Built at startup by querying /v1/models.
+_model_id_to_name: dict[str, str] = {}
+
+
+async def _build_model_identity_map():
+    """Query LiteLLM /model/info and build model_id_hash → readable model name map."""
+    global _model_id_to_name
+    master_key = os.environ.get("LITELLM_MASTER_KEY", "")
+    auth_headers = {"Authorization": f"Bearer {master_key}"} if master_key else {}
+    try:
+        resp = await http_client.get("/model/info", headers=auth_headers)
+        if resp.status_code == 200:
+            data = resp.json()
+            for entry in data.get("data", []):
+                id_hash = entry.get("model_info", {}).get("id", "")
+                litellm_model = entry.get("litellm_params", {}).get("model", "")
+                if id_hash and litellm_model:
+                    _model_id_to_name[id_hash] = litellm_model
+            log.info("MODEL_MAP  built %d model identity mappings", len(_model_id_to_name))
+        else:
+            log.warning("MODEL_MAP  failed to query /model/info (status=%d)", resp.status_code)
+    except Exception as e:
+        log.warning("MODEL_MAP  failed: %s", e)
+
+
+def resolve_model_name(model_id_hash: str) -> str:
+    """Resolve an opaque model ID hash to a readable model name."""
+    return _model_id_to_name.get(model_id_hash, model_id_hash)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -119,6 +270,53 @@ http_client: httpx.AsyncClient | None = None
 
 import asyncio
 
+# ── Auto-flush cooldowns on 429 burst ──
+# Track recent 429s. If we see 3+ in 30 seconds, flush LiteLLM cooldowns.
+_recent_429_timestamps: list[float] = []
+
+# ── Concurrent rescue limiter ──
+# Prevent Ollama overwhelm when many requests timeout simultaneously.
+_active_rescues = 0
+_MAX_CONCURRENT_RESCUES = 3  # Ollama can handle ~3 concurrent 27B requests
+_last_auto_flush: float = 0
+AUTO_FLUSH_THRESHOLD = 3      # consecutive 429s to trigger flush
+AUTO_FLUSH_WINDOW = 30        # seconds window for burst detection
+AUTO_FLUSH_COOLDOWN = 60      # don't auto-flush more than once per 60s
+
+# ── Soft circuit breaker per provider ──
+# If a provider's error rate exceeds this threshold over the last 5 minutes,
+# the router will proactively skip it by adding X-LiteLLM-Exclude header.
+CIRCUIT_BREAKER_THRESHOLD = 0.50  # 50% error rate triggers circuit break
+CIRCUIT_BREAKER_MIN_REQUESTS = 5  # need at least 5 requests to evaluate
+
+# ── Soft timeout with retry ──
+# If a streaming response doesn't start within this many seconds, abort and
+# retry via Ollama. Prevents clients waiting 600s for a hung provider.
+SOFT_TIMEOUT_SECONDS = 300    # 5 minutes (vs 600s hard limit)
+
+
+async def _auto_flush_if_needed():
+    """Flush LiteLLM cooldowns if we're in a 429 burst."""
+    global _last_auto_flush
+    now = time.monotonic()
+
+    # Prune old timestamps
+    _recent_429_timestamps[:] = [t for t in _recent_429_timestamps if now - t < AUTO_FLUSH_WINDOW]
+    _recent_429_timestamps.append(now)
+
+    if len(_recent_429_timestamps) >= AUTO_FLUSH_THRESHOLD and (now - _last_auto_flush) > AUTO_FLUSH_COOLDOWN:
+        _last_auto_flush = now
+        try:
+            flush_resp = await http_client.post("/router/flush-cooldowns")
+            log.warning(
+                "AUTO_FLUSH  %d 429s in %ds → flushed LiteLLM cooldowns (status=%d)",
+                len(_recent_429_timestamps), AUTO_FLUSH_WINDOW, flush_resp.status_code
+            )
+            _recent_429_timestamps.clear()
+        except Exception as e:
+            log.warning("AUTO_FLUSH  failed to flush cooldowns: %s", e)
+
+
 # Ollama host health state — updated by background probe
 ollama_health: dict[str, bool] = {}
 OLLAMA_HOSTS = {
@@ -127,6 +325,54 @@ OLLAMA_HOSTS = {
 }
 # Reverse map: URL → env var name (for matching config entries)
 OLLAMA_URL_TO_NAME = {url: name for name, url in OLLAMA_HOSTS.items() if url}
+
+
+# ── Alias → Ollama host mapping (built from config at startup) ──
+# Parsed lazily on first request to avoid import-time file reads
+_alias_ollama_map: dict[str, set[str]] | None = None
+
+
+def _build_alias_ollama_map():
+    """Parse litellm_config.yaml and build alias → set of Ollama host env vars."""
+    global _alias_ollama_map
+    _alias_ollama_map = {}
+    config_path = os.environ.get("CONFIG_PATH", "litellm_config.yaml")
+    try:
+        import yaml
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f)
+        for entry in cfg.get("model_list", []):
+            model = entry.get("litellm_params", {}).get("model", "")
+            alias = entry.get("model_name", "")
+            api_base = entry.get("litellm_params", {}).get("api_base", "")
+            # Detect Ollama entries: either ollama/ prefix or api_base pointing to Ollama host
+            is_ollama = model.startswith("ollama/") or any(
+                url in api_base for url in OLLAMA_HOSTS.values() if url
+            )
+            if is_ollama and api_base:
+                _alias_ollama_map.setdefault(alias, set()).add(api_base)
+        log.info("OLLAMA_MAP  built alias→host map: %s",
+                 {k: list(v) for k, v in _alias_ollama_map.items()})
+    except Exception as e:
+        log.warning("OLLAMA_MAP  failed to parse config: %s", e)
+        _alias_ollama_map = {}
+
+
+def alias_has_ollama(alias: str) -> bool:
+    """Check if an alias contains Ollama deployments."""
+    if _alias_ollama_map is None:
+        _build_alias_ollama_map()
+    return alias in _alias_ollama_map
+
+
+def alias_ollama_all_down(alias: str) -> bool:
+    """Check if ALL Ollama hosts for an alias are down."""
+    if _alias_ollama_map is None:
+        _build_alias_ollama_map()
+    hosts = _alias_ollama_map.get(alias, set())
+    if not hosts:
+        return False  # no Ollama in this alias
+    return all(not is_ollama_host_healthy(h) for h in hosts)
 
 
 def is_ollama_host_healthy(api_base_env: str) -> bool:
@@ -171,11 +417,13 @@ async def lifespan(app: FastAPI):
     global http_client
     http_client = httpx.AsyncClient(
         base_url=LITELLM_BASE,
-        timeout=httpx.Timeout(connect=10, read=600, write=30, pool=10),
+        timeout=httpx.Timeout(connect=10, read=120, write=30, pool=10),
         limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
     )
     # Start background Ollama health probe
     probe_task = asyncio.create_task(probe_ollama_hosts())
+    # Build model identity map (resolve opaque hashes to readable names)
+    await _build_model_identity_map()
     log.info("Router started — forwarding to %s", LITELLM_BASE)
     yield
     probe_task.cancel()
@@ -344,6 +592,30 @@ def normalize_response(body: bytes) -> bytes:
     return body
 
 
+def repair_tool_schemas(data: dict) -> bool:
+    """
+    Fix tool/function schemas that strict providers (GitHub) reject.
+    GitHub requires 'properties' key in object-type parameters, even if empty.
+    Returns True if any repairs were made.
+    """
+    tools = data.get("tools", [])
+    if not tools:
+        return False
+    repaired = False
+    for tool in tools:
+        fn = tool.get("function", {})
+        params = fn.get("parameters", {})
+        if params.get("type") == "object" and "properties" not in params:
+            params["properties"] = {}
+            repaired = True
+        # Also fix nested parameter schemas
+        for prop in params.get("properties", {}).values():
+            if isinstance(prop, dict) and prop.get("type") == "object" and "properties" not in prop:
+                prop["properties"] = {}
+                repaired = True
+    return repaired
+
+
 def repair_messages(data: dict) -> bool:
     """
     Fix conversation history issues that cause 400/500 errors.
@@ -362,6 +634,8 @@ def repair_messages(data: dict) -> bool:
         return False
 
     repaired = False
+    orphan_count = 0
+    null_content_count = 0
 
     # Pass 1: collect valid tool_call IDs and fix null content
     valid_tc_ids = set()
@@ -370,10 +644,12 @@ def repair_messages(data: dict) -> bool:
             # Fix null content on assistant with tool_calls
             if msg.get("content") is None and msg.get("tool_calls"):
                 msg["content"] = ""
+                null_content_count += 1
                 repaired = True
             # Fix null content on assistant without tool_calls
             elif msg.get("content") is None and not msg.get("tool_calls"):
                 msg["content"] = ""
+                null_content_count += 1
                 repaired = True
             # Collect tool_call IDs
             for tc in msg.get("tool_calls", []):
@@ -407,13 +683,13 @@ def repair_messages(data: dict) -> bool:
 
             # Check: does this tool result match ANY assistant tool_call?
             if tc_id not in valid_tc_ids and normalized_id not in valid_tc_ids:
-                log.warning("REPAIR  removed orphan tool result (tool_call_id=%s)", tc_id)
+                orphan_count += 1
                 repaired = True
                 continue
 
             # Check: does this tool result have a tool_call_id at all?
             if not tc_id:
-                log.warning("REPAIR  removed tool message with no tool_call_id")
+                orphan_count += 1
                 repaired = True
                 continue
 
@@ -425,6 +701,14 @@ def repair_messages(data: dict) -> bool:
 
     if repaired:
         data["messages"] = cleaned
+        # Batch log repairs — one line per request instead of per orphan
+        parts = []
+        if orphan_count:
+            parts.append(f"{orphan_count} orphan tool result(s)")
+        if null_content_count:
+            parts.append(f"{null_content_count} null content fix(es)")
+        if parts:
+            log.warning("REPAIR  %s", ", ".join(parts))
 
     return repaired
 
@@ -441,6 +725,73 @@ def extract_user_text(messages: list[dict]) -> str:
                     p.get("text", "") for p in content if p.get("type") == "text"
                 )
     return ""
+
+
+# ── Fast content feature extraction for ML router training ──
+# All regex-based, <0.1ms total — cheaper than a single string comparison
+
+_CODE_BLOCK_RE = re.compile(r"```(\w*)")
+_LANG_PATTERNS = {
+    "python": re.compile(r"\bdef \w+|import \w+|class \w+.*:|\.py\b|python", re.I),
+    "javascript": re.compile(r"\bfunction\s|const\s|let\s|=>\s|\.js\b|\.tsx?\b|javascript|typescript", re.I),
+    "java": re.compile(r"\bpublic class|System\.out|\.java\b", re.I),
+    "rust": re.compile(r"\bfn \w+|impl \w+|\.rs\b|rust\b", re.I),
+    "go": re.compile(r"\bfunc \w+|package \w+|\.go\b", re.I),
+    "bash": re.compile(r"\bbash\b|#!/bin|\.sh\b|\$\(|apt-get|pip install", re.I),
+    "sql": re.compile(r"\bSELECT\s|INSERT\s|CREATE TABLE|\.sql\b", re.I),
+    "html": re.compile(r"<div|<html|<body|\.html\b|\.css\b", re.I),
+}
+_TASK_PATTERNS = {
+    "generate": re.compile(r"\b(write|create|generate|implement|build|make)\b", re.I),
+    "debug": re.compile(r"\b(fix|debug|error|bug|traceback|exception|failing)\b", re.I),
+    "explain": re.compile(r"\b(explain|what does|how does|why does|describe)\b", re.I),
+    "refactor": re.compile(r"\b(refactor|improve|optimize|clean up|simplify)\b", re.I),
+    "test": re.compile(r"\b(test|unittest|pytest|jest|spec)\b", re.I),
+    "review": re.compile(r"\b(review|check|audit|validate)\b", re.I),
+}
+
+
+def extract_content_features(text: str, messages: list[dict]) -> dict:
+    """Extract cheap content features for ML router training. <0.1ms."""
+    features = {}
+
+    # Code detection
+    code_blocks = _CODE_BLOCK_RE.findall(text)
+    features["has_code_blocks"] = len(code_blocks) > 0
+    features["code_block_count"] = len(code_blocks)
+
+    # Language detection (from code blocks + text)
+    all_text = text
+    for m in messages:
+        c = m.get("content", "")
+        if isinstance(c, str):
+            all_text += " " + c[:2000]  # sample first 2K chars per message
+
+    detected_langs = []
+    for lang, pattern in _LANG_PATTERNS.items():
+        if pattern.search(all_text):
+            detected_langs.append(lang)
+    features["detected_languages"] = detected_langs[:5]
+    features["primary_language"] = detected_langs[0] if detected_langs else None
+
+    # Task type detection
+    detected_tasks = []
+    for task, pattern in _TASK_PATTERNS.items():
+        if pattern.search(text):
+            detected_tasks.append(task)
+    features["task_types"] = detected_tasks
+    features["primary_task"] = detected_tasks[0] if detected_tasks else None
+
+    # Content complexity signals
+    features["has_urls"] = bool(re.search(r"https?://", text))
+    features["has_file_paths"] = bool(re.search(r"[/\\]\w+\.\w{1,5}\b", text))
+    features["has_json"] = bool(re.search(r'[{"\[]\s*"?\w+"?\s*:', text))
+    features["has_error_trace"] = bool(re.search(r"Traceback|Error:|Exception:|FAILED", text))
+    features["avg_message_length"] = sum(
+        len(str(m.get("content", ""))) for m in messages
+    ) // max(len(messages), 1)
+
+    return features
 
 
 def classify_request(data: dict) -> tuple[str, str]:
@@ -567,6 +918,75 @@ async def router_health():
     }
 
 
+@app.post("/router/flush-cooldowns")
+async def flush_cooldowns():
+    """Emergency endpoint: clear all provider cooldowns in Redis.
+    Use when all providers are locked out after a restart/outage.
+    POST /router/flush-cooldowns
+    """
+    try:
+        import redis
+        r = redis.Redis(
+            host=os.environ.get("REDIS_HOST", "localhost"),
+            port=int(os.environ.get("REDIS_PORT", "6379")),
+        )
+        keys = r.keys("deployment:*:cooldown")
+        count = 0
+        for key in keys:
+            r.delete(key)
+            count += 1
+        log.warning("FLUSH_COOLDOWNS  cleared %d provider cooldowns", count)
+        return {"status": "flushed", "cooldowns_cleared": count}
+    except Exception as e:
+        log.error("FLUSH_COOLDOWNS  failed: %s", e)
+        return Response(
+            content=json.dumps({"error": {"message": f"Failed to flush: {e}", "code": 500}}),
+            status_code=500,
+            media_type="application/json",
+        )
+
+
+@app.get("/router/provider-status")
+async def provider_status():
+    """Report per-provider health stats (rolling 5-min window) and circuit breaker state."""
+    now = time.monotonic()
+    cutoff = now - _PROVIDER_STATS_WINDOW
+    providers = {}
+    for provider, history in _provider_history.items():
+        entries = [(t, s, l) for t, s, l in history if t > cutoff]
+        if not entries:
+            continue
+        errors = sum(1 for _, s, _ in entries if s >= 400)
+        error_429s = sum(1 for _, s, _ in entries if s == 429)
+        avg_lat = sum(l for _, _, l in entries) // len(entries)
+        error_rate = round(errors / len(entries), 3)
+        providers[provider] = {
+            "requests_5m": len(entries),
+            "errors_5m": errors,
+            "rate_limits_5m": error_429s,
+            "error_rate": error_rate,
+            "avg_latency_ms": avg_lat,
+            "circuit_broken": error_rate >= CIRCUIT_BREAKER_THRESHOLD and len(entries) >= CIRCUIT_BREAKER_MIN_REQUESTS,
+        }
+    broken = get_circuit_broken_providers()
+    return {
+        "providers": providers,
+        "circuit_broken": broken,
+        "ollama_hosts": {
+            name: {"url": url, "healthy": ollama_health.get(name, False)}
+            for name, url in OLLAMA_HOSTS.items() if url
+        },
+        "model_identity_count": len(_model_id_to_name),
+    }
+
+
+@app.post("/router/rebuild-model-map")
+async def rebuild_model_map():
+    """Force rebuild the model ID → name lookup table."""
+    await _build_model_identity_map()
+    return {"status": "rebuilt", "mappings": len(_model_id_to_name)}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PROXY (catch-all — must be last)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -574,6 +994,7 @@ async def router_health():
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy(request: Request, path: str):
     """Forward all requests to LiteLLM, with smart model rewriting on chat completions."""
+    global _active_rescues
 
     url = f"/{path}"
     headers = {k: v for k, v in request.headers.items()
@@ -606,6 +1027,42 @@ async def proxy(request: Request, path: str):
             payload_chars = len(json.dumps(messages))
             estimated_tokens = payload_chars // 4
 
+            # Tool names — important: some tools fail on specific providers
+            tool_names = []
+            tool_has_nested_objects = False
+            for t in data.get("tools", []):
+                fn = t.get("function", {})
+                if fn.get("name"):
+                    tool_names.append(fn["name"])
+                # Detect complex schemas that some providers reject
+                params = fn.get("parameters", {})
+                for prop in params.get("properties", {}).values():
+                    if isinstance(prop, dict) and prop.get("type") == "object":
+                        tool_has_nested_objects = True
+
+            # System prompt features
+            system_text = ""
+            for m in messages:
+                if m.get("role") == "system":
+                    c = m.get("content", "")
+                    if isinstance(c, str):
+                        system_text = c
+                    break
+            system_prompt_length = len(system_text)
+            system_is_agent = any(w in system_text.lower() for w in
+                ["agent", "tool", "function", "execute", "run command", "bash"]) if system_text else False
+
+            # Conversation depth — count completed tool-call rounds
+            tool_rounds = 0
+            for m in messages:
+                if m.get("role") == "assistant" and m.get("tool_calls"):
+                    tool_rounds += 1
+
+            # Total conversation tokens estimate (all messages, not just user text)
+            total_conversation_chars = sum(
+                len(json.dumps(m.get("content", "") or "")) for m in messages
+            )
+
             training_features = {
                 "original_model": original_model,
                 "message_count": len(messages),
@@ -626,6 +1083,18 @@ async def proxy(request: Request, path: str):
                 "system_messages": role_counts.get("system", 0),
                 "estimated_input_tokens": estimated_tokens,
                 "payload_chars": payload_chars,
+                # Tool details for provider compatibility learning
+                "tool_names": tool_names[:20],  # cap at 20 to avoid bloat
+                "tool_has_nested_objects": tool_has_nested_objects,
+                # Conversation depth features
+                "tool_rounds": tool_rounds,
+                "total_conversation_chars": total_conversation_chars,
+                "estimated_total_tokens": total_conversation_chars // 4,
+                # System prompt features
+                "system_prompt_length": system_prompt_length,
+                "system_is_agent": system_is_agent,
+                # Content features for ML routing (cheap regex, <0.1ms)
+                **extract_content_features(user_text, messages),
             }
 
             # Always classify for training data, even if we don't reroute
@@ -649,22 +1118,73 @@ async def proxy(request: Request, path: str):
             # Large payload? Use _large alias variant (no small-context models)
             payload_chars = len(json.dumps(data.get("messages", [])))
             effective_model = data.get("model", "")
-            if payload_chars > 6000 and effective_model in ("tools", "bench"):
-                data["model"] = f"{effective_model}_large"
+            LARGE_REWRITE = {"tools": "tools_large", "bench": "bench_large", "swebench": "tools_large"}
+            if payload_chars > 6000 and effective_model in LARGE_REWRITE:
+                data["model"] = LARGE_REWRITE[effective_model]
                 log.info(
                     "LARGE  %s → %s  payload=%d chars",
                     effective_model, data["model"], payload_chars
                 )
 
-            # Default to streaming — avoids timeouts on thinking models,
-            # faster time-to-first-token, better UX
+            # ── Ollama health-gated bypass ──
+            # If the chosen alias has Ollama and all Ollama hosts are down,
+            # rewrite to _cloud variant to avoid 60-85s dead-host timeouts.
+            # For explicit local/ollama requests, fail fast with 503.
+            effective_model = data.get("model", "")
+            is_local_request = (
+                effective_model == "local"
+                or effective_model.startswith("ollama/")
+            )
+
+            if is_local_request and alias_ollama_all_down(effective_model):
+                # Explicit local request but Ollama is down — fail fast
+                log.warning(
+                    "OLLAMA_503  model=%s — all Ollama hosts down, returning 503",
+                    effective_model
+                )
+                return Response(
+                    content=json.dumps({
+                        "error": {
+                            "message": f"Local Ollama backend unavailable (all hosts down). "
+                                       f"Use a cloud alias instead of '{effective_model}'.",
+                            "code": 503,
+                        }
+                    }),
+                    status_code=503,
+                    media_type="application/json",
+                )
+
+            # Only aliases that have a dedicated _cloud variant get bypassed.
+            # Mixed aliases like tools_large already contain cloud providers — no bypass needed.
+            CLOUD_BYPASS_ALIASES = {"default", "tools", "tools_stable", "bench", "bench_stable",
+                                    "swebench", "coding", "thinking"}
+            if (effective_model in CLOUD_BYPASS_ALIASES
+                    and alias_has_ollama(effective_model) and alias_ollama_all_down(effective_model)):
+                cloud_alias = f"{effective_model}_cloud"
+                data["model"] = cloud_alias
+                log.info(
+                    "OLLAMA_BYPASS  %s → %s  reason=all Ollama hosts down",
+                    effective_model, cloud_alias
+                )
+
+            # Respect client's stream preference (OpenAI spec: default false).
+            # Only default to streaming if client didn't specify.
+            # Note: benchmarks and SDK clients expect JSON when stream is unset.
             if "stream" not in data:
-                data["stream"] = True
-                log.info("STREAM  defaulting to stream=true")
+                data["stream"] = False
+
+            # Request streaming usage for ML training data collection
+            if data.get("stream"):
+                data.setdefault("stream_options", {})["include_usage"] = True
 
             # Repair broken conversation history (orphan tool results, null content)
             if repair_messages(data):
                 log.info("REPAIR  fixed conversation history issues")
+
+            # Repair tool schemas (add missing 'properties' for strict providers like GitHub)
+            if repair_tool_schemas(data):
+                log.info("REPAIR  fixed tool schemas (added missing properties)")
+
 
             # Normalize tool_call_ids for cross-provider compatibility
             if normalize_request(data):
@@ -682,49 +1202,241 @@ async def proxy(request: Request, path: str):
     except (json.JSONDecodeError, ValueError):
         pass
 
-    # ── Forward to LiteLLM ──
+    # ── Forward to LiteLLM (with 429 → Ollama retry) ──
+    # If LiteLLM returns 429 (all cloud providers exhausted), retry once with
+    # tools_local (pure Ollama) before returning the error to the client.
+    # This is the last-resort catch — the north star is: never 429 the client.
+    OLLAMA_RETRY_ALIASES = {"tools", "tools_large", "tools_cloud", "tools_stable",
+                            "bench", "bench_large", "bench_cloud", "bench_stable",
+                            "swebench", "swebench_cloud", "default", "default_cloud",
+                            "coding", "coding_cloud", "thinking", "thinking_cloud"}
+    ollama_retried = False
+
+    # ── Circuit breaker: log proactive provider skipping ──
+    if is_chat:
+        broken = get_circuit_broken_providers()
+        if broken:
+            log.warning("CIRCUIT_BREAK  providers failing >50%%: %s", broken)
+
     try:
         if is_stream:
             req = http_client.build_request(request.method, url, headers=headers, content=body)
-            resp = await http_client.send(req, stream=True)
+            try:
+                resp = await asyncio.wait_for(
+                    http_client.send(req, stream=True),
+                    timeout=SOFT_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                # ── Soft timeout: abort slow provider, retry via Ollama ──
+                elapsed_so_far = time.monotonic() - start
+                current_model = ""
+                try:
+                    current_model = json.loads(body).get("model", "") if body else ""
+                except Exception:
+                    pass
+                can_rescue = (is_chat and current_model in OLLAMA_RETRY_ALIASES
+                              and not alias_ollama_all_down("local")
+                              and _active_rescues < _MAX_CONCURRENT_RESCUES)
+                if can_rescue:
+                    _active_rescues += 1
+                    log.warning(
+                        "SOFT_TIMEOUT  %s timed out after %.0fs → retrying via tools_local",
+                        chosen_alias or current_model or "?", elapsed_so_far
+                    )
+                    try:
+                        retry_data = json.loads(body)
+                        retry_data["model"] = "tools_local"
+                        retry_body = json.dumps(retry_data).encode()
+                        req2 = http_client.build_request("POST", url, headers=headers, content=retry_body)
+                        resp = await http_client.send(req2, stream=True)
+                        _active_rescues = max(0, _active_rescues - 1)
+                        ollama_retried = True
+                        log.info("SOFT_TIMEOUT  rescue started via Ollama")
+                    except Exception as e:
+                        _active_rescues = max(0, _active_rescues - 1)
+                        log.warning("SOFT_TIMEOUT  rescue failed: %s", e)
+                        raise httpx.TimeoutException(f"Soft timeout after {elapsed_so_far:.0f}s")
+                else:
+                    raise httpx.TimeoutException(f"Soft timeout after {elapsed_so_far:.0f}s")
+
+            # ── Streaming wrapper: captures TTFT, token counts, tool_calls from SSE ──
+            _stream_meta = {
+                "ttft_ms": None,       # time to first token
+                "has_tool_calls": False,
+                "finish_reason": None,
+                "prompt_tokens": None,
+                "completion_tokens": None,
+                "total_tokens": None,
+                "stream_error": None,   # mid-stream error if any
+                "chunks": 0,
+            }
+            _stream_start = time.monotonic()
 
             async def stream_gen():
                 try:
                     async for chunk in resp.aiter_bytes():
+                        _stream_meta["chunks"] += 1
+                        # TTFT: time from request start to first data chunk
+                        if _stream_meta["ttft_ms"] is None:
+                            _stream_meta["ttft_ms"] = round((time.monotonic() - _stream_start) * 1000)
+                        # Parse SSE events for usage/tool_calls (cheap — only parse data: lines)
+                        try:
+                            for line in chunk.decode("utf-8", errors="ignore").split("\n"):
+                                if not line.startswith("data: ") or line.strip() == "data: [DONE]":
+                                    continue
+                                evt = json.loads(line[6:])
+                                # Extract usage from final chunk
+                                usage = evt.get("usage")
+                                if usage:
+                                    _stream_meta["prompt_tokens"] = usage.get("prompt_tokens")
+                                    _stream_meta["completion_tokens"] = usage.get("completion_tokens")
+                                    _stream_meta["total_tokens"] = usage.get("total_tokens")
+                                # Detect tool_calls in delta
+                                choices = evt.get("choices", [])
+                                if choices:
+                                    delta = choices[0].get("delta", {})
+                                    if delta.get("tool_calls"):
+                                        _stream_meta["has_tool_calls"] = True
+                                    fr = choices[0].get("finish_reason")
+                                    if fr:
+                                        _stream_meta["finish_reason"] = fr
+                        except Exception:
+                            pass  # Never break the stream for logging
                         yield chunk
                 finally:
                     await resp.aclose()
+
+            # ── 429 interception for streaming ──
+            if resp.status_code == 429 and not ollama_retried and is_chat:
+                original_429_resp = resp
+                current_model = json.loads(body).get("model", "") if body else ""
+                if current_model in OLLAMA_RETRY_ALIASES and not alias_ollama_all_down("local"):
+                    ollama_retried = True
+                    await resp.aclose()
+                    retry_data = json.loads(body)
+                    retry_data["model"] = "tools_local"
+                    retry_body = json.dumps(retry_data).encode()
+                    log.warning(
+                        "429_RESCUE  %s → tools_local (Ollama retry, stream)",
+                        current_model
+                    )
+                    try:
+                        req2 = http_client.build_request(request.method, url, headers=headers, content=retry_body)
+                        rescue_resp = await http_client.send(req2, stream=True)
+                        if rescue_resp.status_code == 200:
+                            resp = rescue_resp
+                            log.info("429_RESCUE  succeeded via Ollama (stream)")
+                        else:
+                            await rescue_resp.aclose()
+                            log.warning("429_RESCUE  failed (status=%d), returning original 429 (stream)", rescue_resp.status_code)
+                    except Exception as e:
+                        log.warning("429_RESCUE  exception: %s, returning original 429 (stream)", e)
+
+            # Auto-flush if streaming 429 reached client
+            if resp.status_code == 429:
+                await _auto_flush_if_needed()
 
             response_headers = dict(resp.headers)
             if chosen_alias:
                 response_headers["X-Router-Alias"] = chosen_alias
                 response_headers["X-Router-Original-Model"] = original_model or "default"
                 response_headers["X-Router-Reason"] = reason or ""
+                if data.get("model", "").endswith("_cloud") and not original_model.endswith("_cloud"):
+                    response_headers["X-Router-Ollama-Bypass"] = "true"
+            if ollama_retried:
+                response_headers["X-Router-429-Rescue"] = "ollama"
 
             elapsed = time.monotonic() - start
             log.info(
-                "STREAM status=%d model=%s %.0fms",
-                resp.status_code, chosen_alias or original_model or "?", elapsed * 1000
+                "STREAM status=%d model=%s %.0fms%s",
+                resp.status_code, chosen_alias or original_model or "?", elapsed * 1000,
+                " (429-rescued by Ollama)" if ollama_retried else ""
             )
 
-            # ── Training log (streaming) ──
+            # ── Training log (streaming) — deferred to after stream completes ──
+            _training_log_data = None
             if training_features:
                 provider = resp.headers.get("x-litellm-model-api-base", "")
                 served_model = resp.headers.get("x-litellm-model-id", "")
-                log_training_sample({
+                resp_duration = resp.headers.get("x-litellm-response-duration-ms", "")
+                resp_cost = resp.headers.get("x-litellm-response-cost-original", "")
+                retries = resp.headers.get("x-litellm-attempted-retries", "")
+                fallbacks = resp.headers.get("x-litellm-attempted-fallbacks", "")
+                _training_log_data = {
                     **training_features,
                     "routed_alias": chosen_alias,
                     "route_reason": reason,
                     "provider_base": provider,
                     "served_model": served_model,
+                    "served_model_name": resolve_model_name(served_model),
                     "status": resp.status_code,
-                    "latency_ms": round(elapsed * 1000),
                     "stream": True,
                     "cache_hit": resp.headers.get("x-litellm-cache-key", "") != "",
-                })
+                    "litellm_duration_ms": float(resp_duration) if resp_duration else None,
+                    "litellm_cost": float(resp_cost) if resp_cost else None,
+                    "litellm_retries": int(retries) if retries else 0,
+                    "litellm_fallbacks": int(fallbacks) if fallbacks else 0,
+                    "ollama_rescued": ollama_retried,
+                }
+
+            async def logging_stream_gen():
+                """Wraps stream_gen to log training data AFTER stream completes."""
+                async for chunk in stream_gen():
+                    yield chunk
+                # Stream finished — now we have all the SSE-extracted metadata
+                if _training_log_data is not None:
+                    stream_elapsed = time.monotonic() - start
+                    _training_log_data["latency_ms"] = round(stream_elapsed * 1000)
+                    # Inject SSE-extracted response data (the big win for ML)
+                    _training_log_data["ttft_ms"] = _stream_meta.get("ttft_ms")
+                    _training_log_data["response_has_tool_calls"] = _stream_meta.get("has_tool_calls", False)
+                    _training_log_data["finish_reason"] = _stream_meta.get("finish_reason")
+                    _training_log_data["prompt_tokens"] = _stream_meta.get("prompt_tokens")
+                    _training_log_data["completion_tokens"] = _stream_meta.get("completion_tokens")
+                    _training_log_data["total_tokens"] = _stream_meta.get("total_tokens")
+                    _training_log_data["stream_chunks"] = _stream_meta.get("chunks", 0)
+                    # Compute throughput if we have completion tokens and timing
+                    ct = _stream_meta.get("completion_tokens")
+                    ttft = _stream_meta.get("ttft_ms")
+                    if ct and ttft and stream_elapsed * 1000 > ttft:
+                        gen_time_s = (stream_elapsed * 1000 - ttft) / 1000
+                        if gen_time_s > 0:
+                            _training_log_data["tokens_per_second"] = round(ct / gen_time_s, 1)
+                    log_training_sample(_training_log_data)
+
+                    # ── Full conversation log (streaming) ──
+                    # Log request + extracted response metadata for successful tool-calling streams
+                    if (_training_log_data.get("status") == 200
+                            and _stream_meta.get("has_tool_calls")
+                            and is_chat):
+                        try:
+                            req_data = json.loads(body)
+                            log_conversation({
+                                "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+                                "id": uuid.uuid4().hex[:12],
+                                "provider": _training_log_data.get("provider", "unknown"),
+                                "model_alias": chosen_alias,
+                                "latency_ms": _training_log_data["latency_ms"],
+                                "prompt_tokens": _stream_meta.get("prompt_tokens"),
+                                "completion_tokens": _stream_meta.get("completion_tokens"),
+                                "ttft_ms": _stream_meta.get("ttft_ms"),
+                                "tokens_per_second": _training_log_data.get("tokens_per_second"),
+                                # Full request
+                                "messages": req_data.get("messages"),
+                                "tools": req_data.get("tools"),
+                                "tool_choice": req_data.get("tool_choice"),
+                                "temperature": req_data.get("temperature"),
+                                "max_tokens": req_data.get("max_tokens") or req_data.get("max_completion_tokens"),
+                                # Streaming — response metadata (can't capture full content without buffering)
+                                "response_has_tool_calls": True,
+                                "finish_reason": _stream_meta.get("finish_reason"),
+                                "stream": True,
+                            })
+                        except Exception:
+                            pass
 
             return StreamingResponse(
-                stream_gen(),
+                logging_stream_gen(),
                 status_code=resp.status_code,
                 headers=response_headers,
                 media_type=resp.headers.get("content-type"),
@@ -740,10 +1452,40 @@ async def proxy(request: Request, path: str):
             resp_body_override = None
 
             if status == 429:
-                log.warning(
-                    "RATE LIMITED  status=429 model=%s %.0fms — provider returned 429",
-                    log_model, elapsed * 1000
-                )
+                # ── 429 interception for non-streaming ──
+                # Save original 429 response in case rescue fails
+                original_429_resp = resp
+                current_model = json.loads(body).get("model", "") if body else ""
+                if not ollama_retried and is_chat and current_model in OLLAMA_RETRY_ALIASES and not alias_ollama_all_down("local"):
+                    ollama_retried = True
+                    retry_data = json.loads(body)
+                    retry_data["model"] = "tools_local"
+                    retry_body = json.dumps(retry_data).encode()
+                    log.warning(
+                        "429_RESCUE  %s → tools_local (Ollama retry, non-stream)",
+                        current_model
+                    )
+                    try:
+                        rescue_resp = await http_client.request(request.method, url, headers=headers, content=retry_body)
+                        if rescue_resp.status_code == 200:
+                            resp = rescue_resp
+                            status = 200
+                            log_model = "tools_local"
+                            log.info("429_RESCUE  succeeded via Ollama")
+                        else:
+                            # Rescue failed — keep original 429 (better than Ollama 500)
+                            log.warning("429_RESCUE  failed (status=%d), returning original 429", rescue_resp.status_code)
+                    except Exception as e:
+                        log.warning("429_RESCUE  exception: %s, returning original 429", e)
+                    elapsed = time.monotonic() - start
+
+                if status == 429:
+                    log.warning(
+                        "RATE LIMITED  status=429 model=%s %.0fms — provider returned 429%s",
+                        log_model, elapsed * 1000,
+                        " (Ollama rescue attempted but failed)" if ollama_retried else ""
+                    )
+                    await _auto_flush_if_needed()
             elif status >= 400:
                 error_msg = ""
                 provider_name = resp.headers.get("x-litellm-model-api-base", "unknown")
@@ -760,10 +1502,42 @@ async def proxy(request: Request, path: str):
                         resp_body_override = None
                 except Exception:
                     resp_body_override = None
-                log.error(
-                    "ERROR  status=%d model=%s provider=%s %.0fms %s",
-                    status, log_model, provider_name, elapsed * 1000, error_msg
-                )
+
+                # ── ContextWindowExceeded rescue ──
+                # LiteLLM's pre_call_checks may reject before trying large-context models.
+                # Retry with tools_large which only has 128K+ models.
+                CTX_RESCUE_ALIASES = {"tools", "bench", "swebench", "bench_stable", "tools_stable"}
+                current_model = json.loads(body).get("model", "") if body else ""
+                if ("ContextWindow" in error_msg and current_model in CTX_RESCUE_ALIASES
+                        and is_chat):
+                    log.warning(
+                        "CTX_RESCUE  %s → tools_large (ContextWindowExceeded, retrying with large-context models)",
+                        current_model
+                    )
+                    try:
+                        retry_data = json.loads(body)
+                        retry_data["model"] = "tools_large"
+                        retry_body = json.dumps(retry_data).encode()
+                        ctx_resp = await http_client.request(request.method, url, headers=headers, content=retry_body)
+                        if ctx_resp.status_code == 200:
+                            resp = ctx_resp
+                            status = 200
+                            log_model = "tools_large"
+                            resp_body_override = None
+                            error_msg = ""
+                            elapsed = time.monotonic() - start
+                            log.info("CTX_RESCUE  succeeded via tools_large (%.0fms)", elapsed * 1000)
+                        else:
+                            log.warning("CTX_RESCUE  failed (status=%d)", ctx_resp.status_code)
+                    except Exception as e:
+                        log.warning("CTX_RESCUE  exception: %s", e)
+                    elapsed = time.monotonic() - start
+
+                if status >= 400:
+                    log.error(
+                        "ERROR  status=%d model=%s provider=%s %.0fms %s",
+                        status, log_model, provider_name, elapsed * 1000, error_msg
+                    )
             else:
                 log.info(
                     "OK     status=%d model=%s %.0fms",
@@ -787,12 +1561,24 @@ async def proxy(request: Request, path: str):
                     usage = json.loads(resp_body).get("usage", {})
                 except Exception:
                     pass
+                # Response quality features
+                resp_data = {}
+                try:
+                    resp_data = json.loads(resp_body)
+                except Exception:
+                    pass
+                resp_msg = resp_data.get("choices", [{}])[0].get("message", {}) if resp_data.get("choices") else {}
+                has_tool_response = bool(resp_msg.get("tool_calls"))
+                finish = resp_data.get("choices", [{}])[0].get("finish_reason", "") if resp_data.get("choices") else ""
+                resp_content_len = len(resp_msg.get("content", "") or "")
+
                 log_training_sample({
                     **training_features,
                     "routed_alias": chosen_alias,
                     "route_reason": reason,
                     "provider_base": provider,
                     "served_model": served_model,
+                    "served_model_name": resolve_model_name(served_model),
                     "status": status,
                     "latency_ms": round(elapsed * 1000),
                     "stream": False,
@@ -800,7 +1586,38 @@ async def proxy(request: Request, path: str):
                     "prompt_tokens": usage.get("prompt_tokens"),
                     "completion_tokens": usage.get("completion_tokens"),
                     "total_tokens": usage.get("total_tokens"),
+                    # NEW: response quality signals
+                    "response_has_tool_calls": has_tool_response,
+                    "response_content_length": resp_content_len,
+                    "finish_reason": finish,
+                    "response_tool_count": len(resp_msg.get("tool_calls", [])),
                 })
+
+                # ── Full conversation log for LLM fine-tuning ──
+                # Only log successful conversations (quality training data)
+                if status == 200 and is_chat:
+                    try:
+                        req_data = json.loads(body)
+                        log_conversation({
+                            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+                            "id": uuid.uuid4().hex[:12],
+                            "provider": training_features.get("provider", "unknown") if training_features else "unknown",
+                            "model_alias": chosen_alias,
+                            "latency_ms": round(elapsed * 1000),
+                            "prompt_tokens": usage.get("prompt_tokens"),
+                            "completion_tokens": usage.get("completion_tokens"),
+                            # Full request
+                            "messages": req_data.get("messages"),
+                            "tools": req_data.get("tools"),
+                            "tool_choice": req_data.get("tool_choice"),
+                            "temperature": req_data.get("temperature"),
+                            "max_tokens": req_data.get("max_tokens") or req_data.get("max_completion_tokens"),
+                            # Full response
+                            "response": resp_msg,
+                            "finish_reason": finish,
+                        })
+                    except Exception:
+                        pass  # never break request flow for logging
 
             # ── Inject routing metadata, fix Content-Length ──
             response_headers = {k: v for k, v in resp.headers.items()
@@ -809,6 +1626,8 @@ async def proxy(request: Request, path: str):
                 response_headers["X-Router-Alias"] = chosen_alias
                 response_headers["X-Router-Original-Model"] = original_model or "default"
                 response_headers["X-Router-Reason"] = reason or ""
+                if data.get("model", "").endswith("_cloud") and not original_model.endswith("_cloud"):
+                    response_headers["X-Router-Ollama-Bypass"] = "true"
 
             # Use enriched error body if available (includes provider name)
             final_body = resp_body
@@ -824,10 +1643,76 @@ async def proxy(request: Request, path: str):
 
     except httpx.TimeoutException:
         elapsed = time.monotonic() - start
+        current_model = ""
+        try:
+            current_model = json.loads(body).get("model", "") if body else ""
+        except Exception:
+            pass
+
+        # ── Timeout rescue: retry via Ollama (with concurrency limit) ──
+        can_rescue = (is_chat and current_model in OLLAMA_RETRY_ALIASES
+                      and not alias_ollama_all_down("local")
+                      and _active_rescues < _MAX_CONCURRENT_RESCUES)
+        if can_rescue:
+            _active_rescues += 1
+            log.warning(
+                "TIMEOUT_RESCUE  %s timed out after %.0fms → retrying via tools_local (Ollama, %d/%d slots)",
+                chosen_alias or original_model or "?", elapsed * 1000,
+                _active_rescues, _MAX_CONCURRENT_RESCUES
+            )
+            try:
+                retry_data = json.loads(body)
+                retry_data["model"] = "tools_local"
+                retry_body = json.dumps(retry_data).encode()
+                rescue_resp = await http_client.request(
+                    "POST", f"/{path}", headers=headers, content=retry_body
+                )
+                if rescue_resp.status_code == 200:
+                    rescue_elapsed = time.monotonic() - start
+                    log.info(
+                        "TIMEOUT_RESCUE  succeeded via Ollama (%.0fms total)",
+                        rescue_elapsed * 1000
+                    )
+                    response_headers = {k: v for k, v in rescue_resp.headers.items()
+                                        if k.lower() not in ("content-length", "transfer-encoding")}
+                    response_headers["X-Router-Timeout-Rescue"] = "ollama"
+                    _active_rescues -= 1
+                    return Response(
+                        content=rescue_resp.content,
+                        status_code=200,
+                        headers=response_headers,
+                        media_type=rescue_resp.headers.get("content-type"),
+                    )
+                else:
+                    log.warning("TIMEOUT_RESCUE  failed (status=%d)", rescue_resp.status_code)
+            except Exception as e:
+                log.warning("TIMEOUT_RESCUE  exception: %s", e)
+            finally:
+                _active_rescues = max(0, _active_rescues - 1)
+        elif is_chat and current_model in OLLAMA_RETRY_ALIASES and _active_rescues >= _MAX_CONCURRENT_RESCUES:
+            log.warning(
+                "TIMEOUT_RESCUE  skipped — Ollama at capacity (%d/%d rescues active)",
+                _active_rescues, _MAX_CONCURRENT_RESCUES
+            )
+
         log.error(
-            "TIMEOUT  model=%s %.0fms — LiteLLM did not respond",
+            "TIMEOUT  status=504 model=%s %.0fms — LiteLLM did not respond",
             chosen_alias or original_model or "?", elapsed * 1000
         )
+        # Log to training data so 504s are visible in ML metrics
+        if training_features:
+            log_training_sample({
+                **training_features,
+                "routed_alias": chosen_alias,
+                "route_reason": reason,
+                "provider_base": "",
+                "served_model": "",
+                "status": 504,
+                "latency_ms": round(elapsed * 1000),
+                "stream": is_stream,
+                "error_category": "timeout",
+                "error_msg": "Gateway timeout — all providers exhausted",
+            })
         return Response(
             content=json.dumps({"error": {"message": "Gateway timeout", "code": 504}}),
             status_code=504,

@@ -15,7 +15,7 @@ GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://localhost:4000")
 
 
 def load_aliases():
-    """Parse litellm_config.yaml and extract alias → model mappings."""
+    """Parse litellm_config.yaml and extract alias → model mappings with context windows."""
     try:
         with open(CONFIG_PATH) as f:
             cfg = yaml.safe_load(f)
@@ -26,25 +26,96 @@ def load_aliases():
     for entry in cfg.get("model_list", []):
         name = entry.get("model_name", "")
         model = entry.get("litellm_params", {}).get("model", "")
+        ctx = entry.get("model_info", {}).get("max_input_tokens", 0)
         if name and model:
-            aliases.setdefault(name, []).append(model)
+            aliases.setdefault(name, {"models": [], "min_ctx": float("inf"), "max_ctx": 0})
+            aliases[name]["models"].append(model)
+            if ctx:
+                aliases[name]["min_ctx"] = min(aliases[name]["min_ctx"], ctx)
+                aliases[name]["max_ctx"] = max(aliases[name]["max_ctx"], ctx)
+    # Fix inf
+    for a in aliases.values():
+        if a["min_ctx"] == float("inf"):
+            a["min_ctx"] = 0
     return aliases
 
 
-ALIAS_DESCRIPTIONS = {
-    "default": "General purpose. Tries all providers, best model first.",
-    "fast": "Lowest latency. Small models on hardware-accelerated infrastructure (Cerebras, Groq).",
-    "thinking": "Deep reasoning and chain-of-thought. DeepSeek R1, QwQ, Gemini 2.5 Pro.",
-    "coding": "Code generation, review, and agentic coding. Codestral, Devstral, Qwen3.",
-    "vision": "Image and multimodal understanding. Gemini, GPT-4o, Pixtral.",
-    "tools": "Function/tool calling. Cerebras primary, NVIDIA secondary, Groq fallback. No Cohere/Mistral.",
-    "tools_stable": "Reliable tool calling. Cerebras, Groq, NVIDIA. Fallback for tools alias.",
-    "tools_large": "Large-context tool calling. Includes Gemini (1M context) for huge prompts.",
-    "bench": "Benchmarking. Cerebras, Groq, NVIDIA, OpenRouter. Optimized for multi-turn tool tasks.",
-    "bench_stable": "Reliable benchmarking. Cerebras, Groq, NVIDIA, OpenRouter.",
-    "swebench": "SWE-bench tasks. Large-context only (128K+). Cerebras, NVIDIA, OpenRouter, Gemini.",
-    "big": "Largest parameter models (120B-405B). For maximum quality when latency is acceptable.",
-    "local": "Ollama only. Never leaves the machine. For privacy-sensitive workloads.",
+ALIAS_DETAILS = {
+    "default": {
+        "description": "General purpose. Tries all providers, best model first.",
+        "best_for": "Simple chat, Q&A, translations, summaries",
+        "streaming": True, "tool_calling": True, "vision": False, "thinking": False,
+    },
+    "fast": {
+        "description": "Lowest latency. Small models on hardware-accelerated infrastructure.",
+        "best_for": "Speed-critical tasks, simple lookups, short responses",
+        "streaming": True, "tool_calling": False, "vision": False, "thinking": False,
+    },
+    "thinking": {
+        "description": "Deep reasoning and chain-of-thought. DeepSeek R1, QwQ, Gemini 2.5 Pro.",
+        "best_for": "Math, analysis, complex reasoning, step-by-step problem solving",
+        "streaming": True, "tool_calling": False, "vision": False, "thinking": True,
+    },
+    "coding": {
+        "description": "Code generation, review, and agentic coding. Codestral, Devstral, Qwen3.",
+        "best_for": "Writing code, debugging, refactoring, code review",
+        "streaming": True, "tool_calling": True, "vision": False, "thinking": False,
+    },
+    "vision": {
+        "description": "Image and multimodal understanding. Gemini, GPT-4o, Pixtral.",
+        "best_for": "Image analysis, OCR, visual Q&A, multimodal tasks",
+        "streaming": True, "tool_calling": True, "vision": True, "thinking": False,
+    },
+    "tools": {
+        "description": "Function/tool calling. Cloud-only for reliable streaming. Cerebras, Groq, NVIDIA.",
+        "best_for": "Agentic workloads, multi-turn tool conversations, function calling",
+        "streaming": True, "tool_calling": True, "vision": False, "thinking": False,
+        "notes": "Ollama excluded (streaming issues). 429 rescue falls back to tools_local (Ollama).",
+    },
+    "tools_large": {
+        "description": "Large-context tool calling. 256K-1M providers for huge prompts.",
+        "best_for": "Tool calling with large codebases (>65K tokens)",
+        "streaming": True, "tool_calling": True, "vision": False, "thinking": False,
+        "notes": "Auto-routed when payload >6K chars. Includes Gemini (1M), Kimi K2 (262K).",
+    },
+    "tools_stable": {
+        "description": "Reliable tool calling fallback. Cerebras + Groq.",
+        "best_for": "Fallback for tools alias when primary providers fail",
+        "streaming": True, "tool_calling": True, "vision": False, "thinking": False,
+    },
+    "tools_local": {
+        "description": "Pure Ollama. Used as 429 rescue when all cloud providers are rate-limited.",
+        "best_for": "Last resort when cloud is exhausted. Unlimited capacity, slower.",
+        "streaming": False, "tool_calling": True, "vision": False, "thinking": False,
+        "notes": "Returns 503 if all Ollama hosts are down.",
+    },
+    "swebench": {
+        "description": "SWE-bench tasks. Massive context (up to 1M). 12 providers across 7 services.",
+        "best_for": "Large repo contexts, multi-turn coding agents, SWE-bench benchmarks",
+        "streaming": True, "tool_calling": True, "vision": False, "thinking": False,
+        "notes": "Includes Gemini 3 (1M), Groq Kimi K2 (262K), OpenRouter 256K models, Ollama 262K.",
+    },
+    "bench": {
+        "description": "General benchmarking. Cerebras, Groq, NVIDIA, OpenRouter + Ollama fallback.",
+        "best_for": "Running benchmark suites across diverse providers",
+        "streaming": True, "tool_calling": True, "vision": False, "thinking": False,
+    },
+    "bench_stable": {
+        "description": "Reliable benchmarking fallback.",
+        "best_for": "Fallback for bench alias",
+        "streaming": True, "tool_calling": True, "vision": False, "thinking": False,
+    },
+    "big": {
+        "description": "Largest parameter models (120B-253B). Maximum quality.",
+        "best_for": "Tasks requiring maximum model quality, complex generation",
+        "streaming": True, "tool_calling": True, "vision": False, "thinking": False,
+    },
+    "local": {
+        "description": "Ollama only. Data never leaves the machine.",
+        "best_for": "Privacy-sensitive work, confidential data, air-gapped environments",
+        "streaming": False, "tool_calling": True, "vision": False, "thinking": True,
+        "notes": "Returns 503 if all Ollama hosts are down. Slower than cloud.",
+    },
 }
 
 PROVIDER_ALIASES = {
@@ -57,22 +128,37 @@ def build_docs():
     aliases = load_aliases()
 
     task_aliases = {}
-    for name, models in aliases.items():
+    for name, data in aliases.items():
         if name in PROVIDER_ALIASES:
             continue
+        details = ALIAS_DETAILS.get(name, {})
+        providers = sorted(set(m.split("/")[0] for m in data["models"] if "/" in m))
         task_aliases[name] = {
-            "description": ALIAS_DESCRIPTIONS.get(name, ""),
-            "models": models,
-            "model_count": len(models),
+            "description": details.get("description", ""),
+            "best_for": details.get("best_for", ""),
+            "models": data["models"],
+            "model_count": len(data["models"]),
+            "context_window": {
+                "min_tokens": data["min_ctx"],
+                "max_tokens": data["max_ctx"],
+            },
+            "capabilities": {
+                "streaming": details.get("streaming", True),
+                "tool_calling": details.get("tool_calling", False),
+                "vision": details.get("vision", False),
+                "thinking": details.get("thinking", False),
+            },
+            "providers": providers,
+            "notes": details.get("notes", ""),
         }
 
     provider_aliases = {}
-    for name, models in aliases.items():
+    for name, data in aliases.items():
         if name in PROVIDER_ALIASES:
             provider_aliases[name] = {
                 "description": f"Direct access to {name.replace('_free', '').title()} provider models for testing.",
-                "models": models,
-                "model_count": len(models),
+                "models": data["models"],
+                "model_count": len(data["models"]),
             }
 
     return {
@@ -206,7 +292,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <h2>Model aliases</h2>
 <p>Set <code>"model"</code> in your request to one of these:</p>
 <table>
-<tr><th>Alias</th><th>Best for</th><th>Models</th></tr>
+<tr><th>Alias</th><th>Best for</th><th>Context</th><th>Capabilities</th><th>Models</th></tr>
 %(alias_rows)s
 </table>
 
@@ -264,14 +350,32 @@ print(response.choices[0].message.content)</pre>
 
 def render_html(docs):
     alias_rows = ""
-    order = ["default", "fast", "thinking", "coding", "vision", "tools", "big", "local"]
+    order = ["default", "tools", "swebench", "tools_large", "coding", "thinking",
+             "vision", "fast", "big", "bench", "local", "tools_local"]
     for name in order:
         info = docs["model_aliases"].get(name, {})
         if not info:
             continue
+        ctx = info.get("context_window", {})
+        min_ctx = ctx.get("min_tokens", 0)
+        max_ctx = ctx.get("max_tokens", 0)
+        ctx_str = f"{max_ctx // 1024}K" if max_ctx else "?"
+        if min_ctx and min_ctx != max_ctx:
+            ctx_str = f"{min_ctx // 1024}K–{max_ctx // 1024}K"
+
+        caps = info.get("capabilities", {})
+        cap_tags = []
+        if caps.get("streaming"): cap_tags.append("stream")
+        if caps.get("tool_calling"): cap_tags.append("tools")
+        if caps.get("vision"): cap_tags.append("vision")
+        if caps.get("thinking"): cap_tags.append("thinking")
+        cap_str = " ".join(f'<span class="tag">{t}</span>' for t in cap_tags)
+
         alias_rows += (
             f'<tr><td><code>{name}</code></td>'
-            f'<td>{info["description"]}</td>'
+            f'<td>{info.get("best_for", info.get("description", ""))}</td>'
+            f'<td>{ctx_str}</td>'
+            f'<td>{cap_str}</td>'
             f'<td>{info["model_count"]} models</td></tr>\n'
         )
 
