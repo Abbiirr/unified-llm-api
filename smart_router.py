@@ -42,7 +42,7 @@ from fastapi.responses import StreamingResponse
 #   litellm/      — LiteLLM proxy logs (managed by run_gateway.sh)
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-LOG_DIR = os.environ.get("LOG_DIR", "logs")
+LOG_DIR = os.path.abspath(os.environ.get("LOG_DIR", os.path.join(os.path.dirname(__file__), "logs")))
 
 os.makedirs(f"{LOG_DIR}/router", exist_ok=True)
 os.makedirs(f"{LOG_DIR}/training", exist_ok=True)
@@ -73,8 +73,8 @@ log.propagate = False
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
-LITELLM_BASE = os.environ.get("LITELLM_BASE", "http://litellm:4000")
-ROUTER_PORT = int(os.environ.get("ROUTER_PORT", "4001"))
+LITELLM_BASE = os.environ.get("LITELLM_BASE", "http://localhost:4002")
+ROUTER_PORT = int(os.environ.get("ROUTER_PORT", "4000"))
 
 # Model names that trigger smart routing. All others pass through as-is.
 AUTO_ROUTE_MODELS = {"auto", "default", ""}
@@ -168,7 +168,7 @@ def log_training_sample(sample: dict):
     elif "openrouter" in pb: sample["provider"] = "openrouter"
     elif "cohere" in pb: sample["provider"] = "cohere"
     elif "cloudflare" in pb: sample["provider"] = "cloudflare"
-    elif "10.112.30.10" in pb or "192.168.0.73" in pb: sample["provider"] = "ollama"
+    elif any(url in pb for url in OLLAMA_HOSTS.values() if url): sample["provider"] = "ollama"
     else: sample["provider"] = "unknown"
     # Rolling provider health stats
     provider_name = sample["provider"]
@@ -637,6 +637,43 @@ def repair_messages(data: dict) -> bool:
     orphan_count = 0
     null_content_count = 0
 
+    # Pass 0: strip non-standard fields that strict providers (Mistral) reject
+    ALLOWED_ASSISTANT_KEYS = {"role", "content", "tool_calls", "name", "refusal"}
+    extra_field_count = 0
+    for msg in messages:
+        if msg.get("role") == "assistant":
+            extra_keys = set(msg.keys()) - ALLOWED_ASSISTANT_KEYS
+            for key in extra_keys:
+                del msg[key]
+                extra_field_count += 1
+                repaired = True
+
+    # Pass 0b: fix malformed tool_call arguments (Groq requires valid JSON)
+    bad_args_count = 0
+    for msg in messages:
+        if msg.get("role") == "assistant":
+            for tc in msg.get("tool_calls", []):
+                fn = tc.get("function", {})
+                args = fn.get("arguments")
+                if args is None:
+                    fn["arguments"] = "{}"
+                    bad_args_count += 1
+                    repaired = True
+                elif isinstance(args, str):
+                    args_stripped = args.strip()
+                    if not args_stripped:
+                        fn["arguments"] = "{}"
+                        bad_args_count += 1
+                        repaired = True
+                    else:
+                        try:
+                            json.loads(args_stripped)
+                        except (json.JSONDecodeError, ValueError):
+                            # Try to salvage: wrap in object if it looks like bare key-values
+                            fn["arguments"] = "{}"
+                            bad_args_count += 1
+                            repaired = True
+
     # Pass 1: collect valid tool_call IDs and fix null content
     valid_tc_ids = set()
     for msg in messages:
@@ -703,6 +740,10 @@ def repair_messages(data: dict) -> bool:
         data["messages"] = cleaned
         # Batch log repairs — one line per request instead of per orphan
         parts = []
+        if extra_field_count:
+            parts.append(f"{extra_field_count} extra field(s) stripped")
+        if bad_args_count:
+            parts.append(f"{bad_args_count} malformed tool arg(s) fixed")
         if orphan_count:
             parts.append(f"{orphan_count} orphan tool result(s)")
         if null_content_count:
@@ -1209,7 +1250,8 @@ async def proxy(request: Request, path: str):
     OLLAMA_RETRY_ALIASES = {"tools", "tools_large", "tools_cloud", "tools_stable",
                             "bench", "bench_large", "bench_cloud", "bench_stable",
                             "swebench", "swebench_cloud", "default", "default_cloud",
-                            "coding", "coding_cloud", "thinking", "thinking_cloud"}
+                            "coding", "coding_cloud", "thinking", "thinking_cloud",
+                            "terminal_bench", "big"}
     ollama_retried = False
 
     # ── Circuit breaker: log proactive provider skipping ──

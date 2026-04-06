@@ -81,8 +81,9 @@ fetch_models() {
             headers="-H \"Authorization: Bearer $COHERE_API_KEY\""
             ;;
         xai)
-            url="https://api.x.ai/v1/models"
-            headers="-H \"Authorization: Bearer $XAI_API_KEY\""
+            # xAI credits exhausted, skip
+            echo "__SKIP__"
+            return
             ;;
         cerebras)
             url="https://api.cerebras.ai/v1/models"
@@ -372,7 +373,7 @@ if [[ "$AUTO_FIX" == true && $FIXES -gt 0 ]]; then
         done
 
         # Restart Router
-        export LITELLM_BASE=http://localhost:4002 ROUTER_PORT=4000 LOG_LEVEL=INFO LOG_DIR="$PROJECT_DIR/logs" CONFIG_PATH="$CONFIG" GATEWAY_URL=http://localhost:4000 OLLAMA_HOST_1=http://10.112.30.10:11434 OLLAMA_HOST_2=http://192.168.0.73:11434
+        export LITELLM_BASE=http://localhost:4002 ROUTER_PORT=4000 LOG_LEVEL=INFO LOG_DIR="$PROJECT_DIR/logs" CONFIG_PATH="$CONFIG" GATEWAY_URL=http://localhost:4000
         nohup uv run python "$PROJECT_DIR/smart_router.py" > /tmp/router_startup.log 2>&1 &
         sleep 5
 

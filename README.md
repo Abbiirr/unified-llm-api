@@ -2,11 +2,18 @@
 
 One OpenAI-compatible endpoint, 9 free cloud providers + local Ollama behind it. Clients never see rate limits.
 
+## Prerequisites
+
+- **Python 3.12+**
+- **[uv](https://docs.astral.sh/uv/getting-started/installation/)** package manager (`curl -LsSf https://astral.sh/uv/install.sh | sh`)
+- **Docker** (for Redis cache)
+- **API keys** from at least 2 providers (see `.env.template` for signup links)
+
 ## Quick Start
 
 ```bash
 # 1. Setup
-cp .env.template .env     # add your API keys
+cp .env.template .env     # edit and add your API keys (minimum: GEMINI + GROQ)
 uv sync                   # install dependencies
 
 # 2. Start everything
@@ -44,6 +51,9 @@ Client → :4000 Smart Router → :4002 LiteLLM → providers
 | `fast` | Simple, speed-critical |
 | `vision` | Image understanding |
 | `local` | Privacy-sensitive (Ollama only) |
+| `terminal_bench` | Terminal/CLI coding agents, strongest models |
+
+Provider-specific aliases (`groq_free`, `nvidia_free`, etc.) also exist for direct testing.
 
 ## Scripts
 
@@ -54,7 +64,9 @@ Client → :4000 Smart Router → :4002 LiteLLM → providers
 | `scripts/watchdog.sh` | Auto-restart crashed services (run with nohup) |
 | `scripts/status.sh` | Show gateway health, traffic, training data stats |
 | `scripts/test_gateway.sh` | Full smoke test suite |
+| `scripts/test_models.sh` | Test each model against its alias requirements |
 | `scripts/test_ollama_models.sh` | Test and benchmark Ollama models |
+| `scripts/probe_providers.sh` | Auto-probe provider APIs, detect broken models, `--fix` to repair |
 
 ## Running Without Claude
 

@@ -19,6 +19,7 @@ Auth:     Bearer <LITELLM_MASTER_KEY from .env>
 | `fast` | Simple, speed-critical tasks |
 | `vision` | Image understanding |
 | `local` | Privacy-sensitive (Ollama only) |
+| `terminal_bench` | Terminal/CLI coding agents, strongest models |
 
 ## What the gateway handles for you
 

@@ -10,7 +10,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import yaml
 
-CONFIG_PATH = os.environ.get("CONFIG_PATH", "/app/config.yaml")
+CONFIG_PATH = os.environ.get("CONFIG_PATH", os.path.join(os.path.dirname(__file__), "litellm_config.yaml"))
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://localhost:4000")
 
 
@@ -115,6 +115,12 @@ ALIAS_DETAILS = {
         "best_for": "Privacy-sensitive work, confidential data, air-gapped environments",
         "streaming": False, "tool_calling": True, "vision": False, "thinking": True,
         "notes": "Returns 503 if all Ollama hosts are down. Slower than cloud.",
+    },
+    "terminal_bench": {
+        "description": "Terminal/CLI coding benchmark. Strongest reasoning + code models, 10 providers.",
+        "best_for": "Terminal-based coding agents, CLI tool use, shell scripting, SWE benchmarks",
+        "streaming": True, "tool_calling": True, "vision": False, "thinking": True,
+        "notes": "Led by Cerebras gpt-oss-120b, Gemini 3.1 Pro, Mistral Small 4, Nemotron-3-nano. Ollama fallback.",
     },
 }
 
@@ -351,7 +357,7 @@ print(response.choices[0].message.content)</pre>
 def render_html(docs):
     alias_rows = ""
     order = ["default", "tools", "swebench", "tools_large", "coding", "thinking",
-             "vision", "fast", "big", "bench", "local", "tools_local"]
+             "vision", "fast", "big", "bench", "terminal_bench", "local", "tools_local"]
     for name in order:
         info = docs["model_aliases"].get(name, {})
         if not info:

@@ -40,9 +40,9 @@ model_list:
     max_input_tokens: 1048576
 - model_name: thinking
   litellm_params:
-    model: openrouter/qwen/qwen3.6-plus-preview:free
+    model: openrouter/qwen/qwen3.6-plus:free
     api_key: os.environ/OPENROUTER_API_KEY
-    order: 2
+    order: 1
     cooldown_time: 60
   model_info:
     max_input_tokens: 131072
@@ -96,9 +96,9 @@ model_list:
     max_input_tokens: 256000
 - model_name: coding
   litellm_params:
-    model: openrouter/qwen/qwen3.6-plus-preview:free
+    model: openrouter/qwen/qwen3.6-plus:free
     api_key: os.environ/OPENROUTER_API_KEY
-    order: 2
+    order: 1
     cooldown_time: 60
   model_info:
     max_input_tokens: 131072
@@ -138,7 +138,7 @@ model_list:
   litellm_params:
     model: openrouter/qwen/qwen3-coder:free
     api_key: os.environ/OPENROUTER_API_KEY
-    order: 2
+    order: 1
     cooldown_time: 60
   model_info:
     max_input_tokens: 262144
@@ -322,7 +322,7 @@ model_list:
   litellm_params:
     model: groq/meta-llama/llama-4-scout-17b-16e-instruct
     api_key: os.environ/GROQ_API_KEY
-    order: 2
+    order: 1
     cooldown_time: 60
   model_info:
     max_input_tokens: 131072
@@ -330,7 +330,7 @@ model_list:
   litellm_params:
     model: groq/kimi-k2
     api_key: os.environ/GROQ_API_KEY
-    order: 2
+    order: 1
     cooldown_time: 60
   model_info:
     max_input_tokens: 131072
@@ -512,7 +512,7 @@ model_list:
     max_input_tokens: 262144
 - model_name: openrouter_free
   litellm_params:
-    model: openrouter/qwen/qwen3.6-plus-preview:free
+    model: openrouter/qwen/qwen3.6-plus:free
     api_key: os.environ/OPENROUTER_API_KEY
     order: 1
     cooldown_time: 60
@@ -680,9 +680,9 @@ model_list:
     max_input_tokens: 131072
 - model_name: default
   litellm_params:
-    model: openrouter/qwen/qwen3.6-plus-preview:free
+    model: openrouter/qwen/qwen3.6-plus:free
     api_key: os.environ/OPENROUTER_API_KEY
-    order: 2
+    order: 1
     cooldown_time: 60
   model_info:
     max_input_tokens: 131072
@@ -824,14 +824,6 @@ model_list:
     max_input_tokens: 128000
 - model_name: tools_large
   litellm_params:
-    model: xai/grok-4-1-fast-non-reasoning
-    api_key: os.environ/XAI_API_KEY
-    order: 1
-    cooldown_time: 60
-  model_info:
-    max_input_tokens: 2000000
-- model_name: tools_large
-  litellm_params:
     model: cerebras/qwen-3-235b-a22b-instruct-2507
     api_key: os.environ/CEREBRAS_API_KEY
     order: 1
@@ -846,14 +838,6 @@ model_list:
     cooldown_time: 60
   model_info:
     max_input_tokens: 1048576
-- model_name: swebench
-  litellm_params:
-    model: xai/grok-4-1-fast-non-reasoning
-    api_key: os.environ/XAI_API_KEY
-    order: 1
-    cooldown_time: 60
-  model_info:
-    max_input_tokens: 2000000
 - model_name: swebench
   litellm_params:
     model: cerebras/qwen-3-235b-a22b-instruct-2507
@@ -878,86 +862,6 @@ model_list:
     cooldown_time: 60
   model_info:
     max_input_tokens: 128000
-- model_name: default
-  litellm_params:
-    model: ollama/qwen3.5:9b
-    api_base: os.environ/OLLAMA_HOST_2
-    timeout: 300
-    stream_timeout: 600
-    order: 50
-    cooldown_time: 60
-  model_info:
-    max_input_tokens: 262144
-- model_name: bench
-  litellm_params:
-    model: ollama/qwen3.5:9b
-    api_base: os.environ/OLLAMA_HOST_2
-    timeout: 300
-    stream_timeout: 600
-    order: 50
-    cooldown_time: 60
-  model_info:
-    max_input_tokens: 262144
-- model_name: bench_stable
-  litellm_params:
-    model: ollama/qwen3.5:9b
-    api_base: os.environ/OLLAMA_HOST_2
-    timeout: 300
-    stream_timeout: 600
-    order: 50
-    cooldown_time: 60
-  model_info:
-    max_input_tokens: 262144
-- model_name: coding
-  litellm_params:
-    model: ollama/qwen3.5:9b
-    api_base: os.environ/OLLAMA_HOST_2
-    timeout: 300
-    stream_timeout: 600
-    order: 50
-    cooldown_time: 60
-  model_info:
-    max_input_tokens: 262144
-- model_name: thinking
-  litellm_params:
-    model: ollama/qwen3.5:9b
-    api_base: os.environ/OLLAMA_HOST_2
-    timeout: 300
-    stream_timeout: 600
-    order: 50
-    cooldown_time: 60
-  model_info:
-    max_input_tokens: 262144
-- model_name: local
-  litellm_params:
-    model: ollama/qwen3.5:9b
-    api_base: os.environ/OLLAMA_HOST_2
-    timeout: 300
-    stream_timeout: 600
-    order: 50
-    cooldown_time: 60
-  model_info:
-    max_input_tokens: 262144
-- model_name: coding
-  litellm_params:
-    model: ollama/devstral:24b
-    api_base: os.environ/OLLAMA_HOST_2
-    timeout: 300
-    stream_timeout: 600
-    order: 50
-    cooldown_time: 60
-  model_info:
-    max_input_tokens: 131072
-- model_name: thinking
-  litellm_params:
-    model: ollama/sam860/deepseek-r1-0528-qwen3:8b
-    api_base: os.environ/OLLAMA_HOST_2
-    timeout: 300
-    stream_timeout: 600
-    order: 50
-    cooldown_time: 60
-  model_info:
-    max_input_tokens: 131072
 - model_name: default_cloud
   litellm_params:
     model: openrouter/meta-llama/llama-3.3-70b-instruct:free
@@ -1358,66 +1262,6 @@ model_list:
     cooldown_time: 60
   model_info:
     max_input_tokens: 256000
-- model_name: default
-  litellm_params:
-    model: ollama/glm-4.7-flash
-    api_base: os.environ/OLLAMA_HOST_1
-    timeout: 10
-    stream_timeout: 20
-    order: 50
-    cooldown_time: 60
-  model_info:
-    max_input_tokens: 128000
-- model_name: bench
-  litellm_params:
-    model: ollama/glm-4.7-flash
-    api_base: os.environ/OLLAMA_HOST_1
-    timeout: 10
-    stream_timeout: 20
-    order: 50
-    cooldown_time: 60
-  model_info:
-    max_input_tokens: 128000
-- model_name: bench_stable
-  litellm_params:
-    model: ollama/glm-4.7-flash
-    api_base: os.environ/OLLAMA_HOST_1
-    timeout: 10
-    stream_timeout: 20
-    order: 50
-    cooldown_time: 60
-  model_info:
-    max_input_tokens: 128000
-- model_name: coding
-  litellm_params:
-    model: ollama/glm-4.7-flash
-    api_base: os.environ/OLLAMA_HOST_1
-    timeout: 10
-    stream_timeout: 20
-    order: 50
-    cooldown_time: 60
-  model_info:
-    max_input_tokens: 128000
-- model_name: thinking
-  litellm_params:
-    model: ollama/glm-4.7-flash
-    api_base: os.environ/OLLAMA_HOST_1
-    timeout: 10
-    stream_timeout: 20
-    order: 50
-    cooldown_time: 60
-  model_info:
-    max_input_tokens: 128000
-- model_name: local
-  litellm_params:
-    model: ollama/glm-4.7-flash
-    api_base: os.environ/OLLAMA_HOST_1
-    timeout: 10
-    stream_timeout: 20
-    order: 50
-    cooldown_time: 60
-  model_info:
-    max_input_tokens: 128000
 - model_name: fast
   litellm_params:
     model: ollama/qwen3.5:9b
@@ -1434,7 +1278,7 @@ model_list:
     api_base: os.environ/OLLAMA_HOST_1
     timeout: 10
     stream_timeout: 20
-    order: 2
+    order: 1
     cooldown_time: 60
   model_info:
     max_input_tokens: 262144
@@ -1864,62 +1708,6 @@ model_list:
     cooldown_time: 60
   model_info:
     max_input_tokens: 131072
-- model_name: thinking
-  litellm_params:
-    model: xai/grok-3-mini
-    api_key: os.environ/XAI_API_KEY
-    order: 1
-    cooldown_time: 60
-  model_info:
-    max_input_tokens: 131072
-- model_name: coding
-  litellm_params:
-    model: xai/grok-3-mini
-    api_key: os.environ/XAI_API_KEY
-    order: 1
-    cooldown_time: 60
-  model_info:
-    max_input_tokens: 131072
-- model_name: big
-  litellm_params:
-    model: xai/grok-3-mini
-    api_key: os.environ/XAI_API_KEY
-    order: 1
-    cooldown_time: 60
-  model_info:
-    max_input_tokens: 131072
-- model_name: default
-  litellm_params:
-    model: xai/grok-3-mini
-    api_key: os.environ/XAI_API_KEY
-    order: 1
-    cooldown_time: 60
-  model_info:
-    max_input_tokens: 131072
-- model_name: thinking_cloud
-  litellm_params:
-    model: xai/grok-3-mini
-    api_key: os.environ/XAI_API_KEY
-    order: 1
-    cooldown_time: 60
-  model_info:
-    max_input_tokens: 131072
-- model_name: coding_cloud
-  litellm_params:
-    model: xai/grok-3-mini
-    api_key: os.environ/XAI_API_KEY
-    order: 1
-    cooldown_time: 60
-  model_info:
-    max_input_tokens: 131072
-- model_name: default_cloud
-  litellm_params:
-    model: xai/grok-3-mini
-    api_key: os.environ/XAI_API_KEY
-    order: 1
-    cooldown_time: 60
-  model_info:
-    max_input_tokens: 131072
 - model_name: coding
   litellm_params:
     model: mistral/mistral-large-latest
@@ -2024,134 +1812,587 @@ model_list:
     cooldown_time: 60
   model_info:
     max_input_tokens: 256000
-- model_name: thinking
-  litellm_params:
-    model: xai/grok-4-1-fast-reasoning
-    api_key: os.environ/XAI_API_KEY
-    order: 1
-    cooldown_time: 60
-  model_info:
-    max_input_tokens: 2000000
-- model_name: coding
-  litellm_params:
-    model: xai/grok-4-1-fast-reasoning
-    api_key: os.environ/XAI_API_KEY
-    order: 1
-    cooldown_time: 60
-  model_info:
-    max_input_tokens: 2000000
-- model_name: swebench
-  litellm_params:
-    model: xai/grok-4-1-fast-reasoning
-    api_key: os.environ/XAI_API_KEY
-    order: 1
-    cooldown_time: 60
-  model_info:
-    max_input_tokens: 2000000
-- model_name: big
-  litellm_params:
-    model: xai/grok-4-1-fast-reasoning
-    api_key: os.environ/XAI_API_KEY
-    order: 1
-    cooldown_time: 60
-  model_info:
-    max_input_tokens: 2000000
-- model_name: tools
-  litellm_params:
-    model: xai/grok-4-1-fast-non-reasoning
-    api_key: os.environ/XAI_API_KEY
-    order: 1
-    cooldown_time: 60
-  model_info:
-    max_input_tokens: 2000000
-- model_name: default
-  litellm_params:
-    model: xai/grok-4-1-fast-non-reasoning
-    api_key: os.environ/XAI_API_KEY
-    order: 1
-    cooldown_time: 60
-  model_info:
-    max_input_tokens: 2000000
 - model_name: bench
   litellm_params:
-    model: xai/grok-4-1-fast-non-reasoning
-    api_key: os.environ/XAI_API_KEY
-    order: 1
+    model: ollama/qwen3.5:9b
+    api_base: os.environ/OLLAMA_HOST_1
+    timeout: 120
+    stream_timeout: 300
+    order: 50
     cooldown_time: 60
   model_info:
-    max_input_tokens: 2000000
+    max_input_tokens: 32768
 - model_name: bench_stable
   litellm_params:
-    model: xai/grok-4-1-fast-non-reasoning
-    api_key: os.environ/XAI_API_KEY
+    model: ollama/qwen3.5:9b
+    api_base: os.environ/OLLAMA_HOST_1
+    timeout: 120
+    stream_timeout: 300
+    order: 50
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 32768
+- model_name: coding
+  litellm_params:
+    model: ollama/qwen3.5:9b
+    api_base: os.environ/OLLAMA_HOST_1
+    timeout: 120
+    stream_timeout: 300
+    order: 50
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 32768
+- model_name: default
+  litellm_params:
+    model: ollama/qwen3.5:9b
+    api_base: os.environ/OLLAMA_HOST_1
+    timeout: 120
+    stream_timeout: 300
+    order: 50
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 32768
+- model_name: local
+  litellm_params:
+    model: ollama/qwen3.5:9b
+    api_base: os.environ/OLLAMA_HOST_1
+    timeout: 120
+    stream_timeout: 300
+    order: 50
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 32768
+- model_name: thinking
+  litellm_params:
+    model: ollama/qwen3.5:9b
+    api_base: os.environ/OLLAMA_HOST_1
+    timeout: 120
+    stream_timeout: 300
+    order: 50
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 32768
+- model_name: terminal_bench
+  litellm_params:
+    model: cerebras/qwen-3-235b-a22b-instruct-2507
+    api_key: os.environ/CEREBRAS_API_KEY
     order: 1
     cooldown_time: 60
   model_info:
-    max_input_tokens: 2000000
+    max_input_tokens: 65536
+- model_name: terminal_bench
+  litellm_params:
+    model: nvidia_nim/nvidia/nemotron-3-super-120b-a12b
+    api_key: os.environ/NVIDIA_NIM_API_KEY
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 1000000
+- model_name: terminal_bench
+  litellm_params:
+    model: mistral/codestral-latest
+    api_key: os.environ/MISTRAL_API_KEY
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 256000
+- model_name: terminal_bench
+  litellm_params:
+    model: gemini/gemini-3-flash-preview
+    api_key: os.environ/GEMINI_API_KEY
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 1000000
+- model_name: terminal_bench
+  litellm_params:
+    model: groq/moonshotai/kimi-k2-instruct-0905
+    api_key: os.environ/GROQ_API_KEY
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 262144
+- model_name: terminal_bench
+  litellm_params:
+    model: groq/meta-llama/llama-4-scout-17b-16e-instruct
+    api_key: os.environ/GROQ_API_KEY
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 131072
+- model_name: terminal_bench
+  litellm_params:
+    model: nvidia_nim/openai/gpt-oss-120b
+    api_key: os.environ/NVIDIA_NIM_API_KEY
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 128000
+- model_name: terminal_bench
+  litellm_params:
+    model: ollama/qwen3.5:9b
+    api_base: os.environ/OLLAMA_HOST_1
+    timeout: 120
+    stream_timeout: 300
+    order: 50
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 32768
+- model_name: coding
+  litellm_params:
+    model: ollama/gag0/qwen35-opus-distil:27b
+    api_base: os.environ/OLLAMA_HOST_1
+    timeout: 300
+    stream_timeout: 600
+    order: 50
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 32768
+- model_name: thinking
+  litellm_params:
+    model: ollama/gag0/qwen35-opus-distil:27b
+    api_base: os.environ/OLLAMA_HOST_1
+    timeout: 300
+    stream_timeout: 600
+    order: 50
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 32768
+- model_name: swebench
+  litellm_params:
+    model: ollama/gag0/qwen35-opus-distil:27b
+    api_base: os.environ/OLLAMA_HOST_1
+    timeout: 300
+    stream_timeout: 600
+    order: 50
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 32768
+- model_name: terminal_bench
+  litellm_params:
+    model: ollama/gag0/qwen35-opus-distil:27b
+    api_base: os.environ/OLLAMA_HOST_1
+    timeout: 300
+    stream_timeout: 600
+    order: 50
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 32768
+- model_name: tools_local
+  litellm_params:
+    model: ollama/gag0/qwen35-opus-distil:27b
+    api_base: os.environ/OLLAMA_HOST_1
+    timeout: 300
+    stream_timeout: 600
+    order: 50
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 32768
+- model_name: default
+  litellm_params:
+    model: ollama/gag0/qwen35-opus-distil:27b
+    api_base: os.environ/OLLAMA_HOST_1
+    timeout: 300
+    stream_timeout: 600
+    order: 50
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 32768
+- model_name: big
+  litellm_params:
+    model: ollama/gag0/qwen35-opus-distil:27b
+    api_base: os.environ/OLLAMA_HOST_1
+    timeout: 300
+    stream_timeout: 600
+    order: 50
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 32768
+- model_name: thinking
+  litellm_params:
+    model: gemini/gemini-3.1-pro-preview
+    api_key: os.environ/GEMINI_API_KEY
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 1000000
+- model_name: swebench
+  litellm_params:
+    model: gemini/gemini-3.1-pro-preview
+    api_key: os.environ/GEMINI_API_KEY
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 1000000
+- model_name: big
+  litellm_params:
+    model: gemini/gemini-3.1-pro-preview
+    api_key: os.environ/GEMINI_API_KEY
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 1000000
+- model_name: terminal_bench
+  litellm_params:
+    model: gemini/gemini-3.1-pro-preview
+    api_key: os.environ/GEMINI_API_KEY
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 1000000
+- model_name: coding
+  litellm_params:
+    model: gemini/gemma-4-31b-it
+    api_key: os.environ/GEMINI_API_KEY
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 128000
+- model_name: tools
+  litellm_params:
+    model: gemini/gemma-4-31b-it
+    api_key: os.environ/GEMINI_API_KEY
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 128000
+- model_name: default
+  litellm_params:
+    model: gemini/gemma-4-31b-it
+    api_key: os.environ/GEMINI_API_KEY
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 128000
+- model_name: bench
+  litellm_params:
+    model: gemini/gemma-4-31b-it
+    api_key: os.environ/GEMINI_API_KEY
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 128000
 - model_name: fast
   litellm_params:
-    model: xai/grok-3-mini
-    api_key: os.environ/XAI_API_KEY
+    model: gemini/gemma-4-26b-a4b-it
+    api_key: os.environ/GEMINI_API_KEY
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 128000
+- model_name: tools
+  litellm_params:
+    model: gemini/gemma-4-26b-a4b-it
+    api_key: os.environ/GEMINI_API_KEY
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 128000
+- model_name: default
+  litellm_params:
+    model: gemini/gemma-4-26b-a4b-it
+    api_key: os.environ/GEMINI_API_KEY
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 128000
+- model_name: coding
+  litellm_params:
+    model: mistral/mistral-small-2603
+    api_key: os.environ/MISTRAL_API_KEY
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 256000
+- model_name: thinking
+  litellm_params:
+    model: mistral/mistral-small-2603
+    api_key: os.environ/MISTRAL_API_KEY
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 256000
+- model_name: tools
+  litellm_params:
+    model: mistral/mistral-small-2603
+    api_key: os.environ/MISTRAL_API_KEY
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 256000
+- model_name: default
+  litellm_params:
+    model: mistral/mistral-small-2603
+    api_key: os.environ/MISTRAL_API_KEY
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 256000
+- model_name: terminal_bench
+  litellm_params:
+    model: mistral/mistral-small-2603
+    api_key: os.environ/MISTRAL_API_KEY
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 256000
+- model_name: vision
+  litellm_params:
+    model: mistral/mistral-small-2603
+    api_key: os.environ/MISTRAL_API_KEY
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 256000
+- model_name: fast
+  litellm_params:
+    model: nvidia_nim/nvidia/nemotron-3-nano-30b-a3b
+    api_key: os.environ/NVIDIA_NIM_API_KEY
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 256000
+- model_name: tools
+  litellm_params:
+    model: nvidia_nim/nvidia/nemotron-3-nano-30b-a3b
+    api_key: os.environ/NVIDIA_NIM_API_KEY
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 256000
+- model_name: coding
+  litellm_params:
+    model: nvidia_nim/nvidia/nemotron-3-nano-30b-a3b
+    api_key: os.environ/NVIDIA_NIM_API_KEY
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 256000
+- model_name: default
+  litellm_params:
+    model: nvidia_nim/nvidia/nemotron-3-nano-30b-a3b
+    api_key: os.environ/NVIDIA_NIM_API_KEY
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 256000
+- model_name: terminal_bench
+  litellm_params:
+    model: nvidia_nim/nvidia/nemotron-3-nano-30b-a3b
+    api_key: os.environ/NVIDIA_NIM_API_KEY
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 256000
+- model_name: coding
+  litellm_params:
+    model: openrouter/qwen/qwen3-next-80b-a3b-instruct:free
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 262000
+- model_name: swebench
+  litellm_params:
+    model: openrouter/qwen/qwen3-next-80b-a3b-instruct:free
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 262000
+- model_name: terminal_bench
+  litellm_params:
+    model: openrouter/qwen/qwen3-next-80b-a3b-instruct:free
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 262000
+- model_name: tools_large
+  litellm_params:
+    model: openrouter/qwen/qwen3-next-80b-a3b-instruct:free
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 262000
+- model_name: default
+  litellm_params:
+    model: openrouter/minimax/minimax-m2.5:free
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 196000
+- model_name: coding
+  litellm_params:
+    model: openrouter/minimax/minimax-m2.5:free
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 196000
+- model_name: swebench
+  litellm_params:
+    model: openrouter/minimax/minimax-m2.5:free
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 196000
+- model_name: terminal_bench
+  litellm_params:
+    model: openrouter/minimax/minimax-m2.5:free
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 196000
+- model_name: fast
+  litellm_params:
+    model: openrouter/nvidia/nemotron-3-nano-30b-a3b:free
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 256000
+- model_name: default
+  litellm_params:
+    model: openrouter/nvidia/nemotron-3-nano-30b-a3b:free
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 256000
+- model_name: swebench
+  litellm_params:
+    model: openrouter/qwen/qwen3.6-plus:free
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 1000000
+- model_name: big
+  litellm_params:
+    model: openrouter/qwen/qwen3.6-plus:free
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 1000000
+- model_name: tools_large
+  litellm_params:
+    model: openrouter/qwen/qwen3.6-plus:free
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 1000000
+- model_name: tools
+  litellm_params:
+    model: ollama/gag0/qwen35-opus-distil:27b
+    api_base: os.environ/OLLAMA_HOST_1
+    timeout: 300
+    stream_timeout: 600
+    order: 50
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 262144
+- model_name: tools_large
+  litellm_params:
+    model: ollama/gag0/qwen35-opus-distil:27b
+    api_base: os.environ/OLLAMA_HOST_1
+    timeout: 300
+    stream_timeout: 600
+    order: 50
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 262144
+- model_name: big
+  litellm_params:
+    model: openrouter/nousresearch/hermes-3-llama-3.1-405b:free
     order: 1
     cooldown_time: 60
   model_info:
     max_input_tokens: 131072
 - model_name: coding
   litellm_params:
-    model: xai/grok-code-fast-1
-    api_key: os.environ/XAI_API_KEY
-    order: 2
+    model: openrouter/nousresearch/hermes-3-llama-3.1-405b:free
+    order: 1
     cooldown_time: 60
   model_info:
-    max_input_tokens: 2000000
+    max_input_tokens: 131072
 - model_name: swebench
   litellm_params:
-    model: xai/grok-code-fast-1
-    api_key: os.environ/XAI_API_KEY
-    order: 2
-    cooldown_time: 60
-  model_info:
-    max_input_tokens: 2000000
-- model_name: thinking_cloud
-  litellm_params:
-    model: xai/grok-4-1-fast-non-reasoning
-    api_key: os.environ/XAI_API_KEY
+    model: openrouter/nousresearch/hermes-3-llama-3.1-405b:free
     order: 1
     cooldown_time: 60
   model_info:
-    max_input_tokens: 2000000
-- model_name: coding_cloud
+    max_input_tokens: 131072
+- model_name: terminal_bench
   litellm_params:
-    model: xai/grok-4-1-fast-non-reasoning
-    api_key: os.environ/XAI_API_KEY
+    model: openrouter/nousresearch/hermes-3-llama-3.1-405b:free
     order: 1
     cooldown_time: 60
   model_info:
-    max_input_tokens: 2000000
-- model_name: default_cloud
+    max_input_tokens: 131072
+- model_name: default
   litellm_params:
-    model: xai/grok-4-1-fast-non-reasoning
-    api_key: os.environ/XAI_API_KEY
+    model: openrouter/z-ai/glm-4.5-air:free
     order: 1
     cooldown_time: 60
   model_info:
-    max_input_tokens: 2000000
-- model_name: swebench_cloud
+    max_input_tokens: 131072
+- model_name: fast
   litellm_params:
-    model: xai/grok-4-1-fast-non-reasoning
-    api_key: os.environ/XAI_API_KEY
+    model: openrouter/z-ai/glm-4.5-air:free
     order: 1
     cooldown_time: 60
   model_info:
-    max_input_tokens: 2000000
-- model_name: bench_cloud
+    max_input_tokens: 131072
+- model_name: coding
   litellm_params:
-    model: xai/grok-4-1-fast-non-reasoning
-    api_key: os.environ/XAI_API_KEY
+    model: openrouter/z-ai/glm-4.5-air:free
     order: 1
     cooldown_time: 60
   model_info:
-    max_input_tokens: 2000000
+    max_input_tokens: 131072
+- model_name: default
+  litellm_params:
+    model: openrouter/arcee-ai/trinity-large-preview:free
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 131000
+- model_name: coding
+  litellm_params:
+    model: openrouter/arcee-ai/trinity-large-preview:free
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 131000
+- model_name: bench
+  litellm_params:
+    model: openrouter/arcee-ai/trinity-large-preview:free
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 131000
+- model_name: default
+  litellm_params:
+    model: openrouter/google/gemma-3-27b-it:free
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 131072
+- model_name: tools
+  litellm_params:
+    model: openrouter/google/gemma-3-27b-it:free
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 131072
+- model_name: coding
+  litellm_params:
+    model: openrouter/google/gemma-3-27b-it:free
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 131072
+- model_name: vision
+  litellm_params:
+    model: openrouter/nvidia/nemotron-nano-12b-v2-vl:free
+    order: 1
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 128000
 router_settings:
   routing_strategy: latency-based-routing
   num_retries: 4

@@ -31,3 +31,4 @@ __pycache__/
 # PID files
 *.pid
 .*.pid
+*.bak

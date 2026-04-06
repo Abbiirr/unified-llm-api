@@ -9,13 +9,13 @@
 # Usage:
 #   bash scripts/test_ollama_models.sh [HOST_URL] [MODEL_FILTER]
 #   bash scripts/test_ollama_models.sh                          # test all on H1
-#   bash scripts/test_ollama_models.sh http://192.168.0.73:11434
-#   bash scripts/test_ollama_models.sh http://10.112.30.10:11434 gurubot
+#   bash scripts/test_ollama_models.sh $OLLAMA_HOST_2
+#   bash scripts/test_ollama_models.sh $OLLAMA_HOST_1 gurubot
 # =============================================================================
 
 set -euo pipefail
 
-HOST="${1:-http://10.112.30.10:11434}"
+HOST="${1:-${OLLAMA_HOST_1:-http://localhost:11434}}"
 FILTER="${2:-}"
 TIMEOUT=300  # Max seconds to wait for model load
 
