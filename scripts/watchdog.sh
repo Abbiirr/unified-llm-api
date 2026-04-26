@@ -48,7 +48,9 @@ check_and_fix() {
         log "LiteLLM DOWN — restarting"
         pkill -f "litellm --config" 2>/dev/null || true
         sleep 2
+        set -a
         source "$ROOT_DIR/.env" 2>/dev/null || true
+        set +a
         export REDIS_HOST="${REDIS_HOST:-localhost}" REDIS_PORT="${REDIS_PORT:-6379}"
         uv run litellm --config "$ROOT_DIR/litellm_config.yaml" --port 4002 \
             >> "$ROOT_DIR/logs/litellm/gateway.log" 2>&1 &
@@ -71,14 +73,17 @@ check_and_fix() {
         log "Router DOWN — restarting"
         pkill -f "smart_router.py" 2>/dev/null || true
         sleep 2
+        set -a
         source "$ROOT_DIR/.env" 2>/dev/null || true
+        set +a
         export LITELLM_BASE="http://localhost:4002" \
                ROUTER_PORT=4000 LOG_LEVEL=INFO \
                LOG_DIR="$ROOT_DIR/logs" \
                CONFIG_PATH="$ROOT_DIR/litellm_config.yaml" \
                GATEWAY_URL="http://localhost:4000" \
                OLLAMA_HOST_1="${OLLAMA_HOST_1:-}" \
-               OLLAMA_HOST_2="${OLLAMA_HOST_2:-}"
+               OLLAMA_HOST_2="${OLLAMA_HOST_2:-}" \
+               OLLAMA_HOST_3="${OLLAMA_HOST_3:-}"
         uv run python "$ROOT_DIR/smart_router.py" >> "$ROOT_DIR/logs/router/startup.log" 2>&1 &
         log "Router restarted (PID: $!)"
         echo "$!" > "$ROOT_DIR/.router.pid"
@@ -96,9 +101,8 @@ check_and_fix() {
 import json,sys
 try:
     d=json.load(sys.stdin)
-    h1=d['ollama_hosts']['OLLAMA_HOST_1']['healthy']
-    h2=d['ollama_hosts']['OLLAMA_HOST_2']['healthy']
-    print(f'H1:{h1} H2:{h2}')
+    hosts=d.get('ollama_hosts',{})
+    print(' '.join(f'{name}:{info[\"healthy\"]}' for name, info in hosts.items()) or 'no ollama hosts')
 except: print('health parse error')
 " 2>/dev/null)"
         fi

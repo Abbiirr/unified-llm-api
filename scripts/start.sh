@@ -30,6 +30,7 @@ export CONFIG_PATH="${CONFIG_PATH:-$ROOT_DIR/litellm_config.yaml}"
 export GATEWAY_URL="${GATEWAY_URL:-http://localhost:4000}"
 export OLLAMA_HOST_1="${OLLAMA_HOST_1:-}"
 export OLLAMA_HOST_2="${OLLAMA_HOST_2:-}"
+export OLLAMA_HOST_3="${OLLAMA_HOST_3:-}"
 
 mkdir -p "$LOG_DIR/litellm" "$LOG_DIR/router" "$LOG_DIR/training/conversations"
 
@@ -101,10 +102,15 @@ echo "  Redis:   localhost:$REDIS_PORT"
 echo ""
 
 HEALTH=$(curl -s http://localhost:$ROUTER_PORT/router/health 2>/dev/null)
-H1=$(echo "$HEALTH" | python3 -c "import json,sys; print(json.load(sys.stdin)['ollama_hosts']['OLLAMA_HOST_1']['healthy'])" 2>/dev/null || echo "?")
-H2=$(echo "$HEALTH" | python3 -c "import json,sys; print(json.load(sys.stdin)['ollama_hosts']['OLLAMA_HOST_2']['healthy'])" 2>/dev/null || echo "?")
-echo "  Ollama H1: $H1"
-echo "  Ollama H2: $H2"
+echo "$HEALTH" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    for name, info in d.get('ollama_hosts', {}).items():
+        print(f'  {name}: {info.get(\"healthy\", \"?\")}')
+except Exception:
+    print('  Ollama health: ?')
+" 2>/dev/null
 echo ""
 echo "  PIDs: LiteLLM=$LITELLM_PID Router=$ROUTER_PID"
 echo "  Stop: bash scripts/stop.sh"

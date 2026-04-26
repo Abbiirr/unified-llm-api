@@ -5,273 +5,237 @@ Technical deep-dive into how the Unified Free LLM Gateway works.
 ## System overview
 
 ```
-                          ┌─────────────────────────────────────────────┐
-                          │            Docker Compose Stack             │
-                          │                                             │
-  Client Apps             │  ┌───────────────────────┐                  │
-  (OpenAI SDK,            │  │    LiteLLM Proxy       │                  │
-   Open WebUI,    ──────────▶│    (port 4000)         │                  │
-   cURL, etc.)    ◀──────────│                        │                  │
-       │                  │  │  ┌─────────────────┐   │    Provider Pool │
-       │                  │  │  │  Router Engine   │───────▶ OpenRouter  │
-       │                  │  │  │  (latency-based) │───────▶ Google      │
-       │                  │  │  └────────┬────────┘   │    ▶ Cerebras   │
-       │                  │  │           │            │    ▶ Groq       │
-       │                  │  │  ┌────────▼────────┐   │    ▶ GitHub     │
-       │                  │  │  │  Cache Layer     │   │    ▶ Mistral   │
-       │                  │  │  │  (check/store)   │   │    ▶ NVIDIA    │
-       │                  │  │  └────────┬────────┘   │    ▶ Cloudflare │
-       │                  │  │           │            │    ▶ Cohere     │
-       │                  │  └───────────┼───────────┘    ▶ Ollama     │
-       │                  │              │                              │
-       │                  │  ┌───────────▼───────────┐                  │
-       │                  │  │    Redis 7 Alpine      │                  │
-       │                  │  │    (2GB LRU cache)     │                  │
-       │                  │  │    port 6379            │                  │
-       │                  │  └───────────────────────┘                  │
-       │                  └─────────────────────────────────────────────┘
-       │
-       ▼
-  OpenAI-compatible API
-  POST /v1/chat/completions
-  GET  /v1/models
-  GET  /health/readiness
+                        ┌────────────────────────────────────────────────┐
+                        │             Gateway Stack (uv run)              │
+                        │                                                 │
+  Client Apps           │  ┌─────────────────────────────────────────┐   │
+  (OpenAI SDK,          │  │         Smart Router  :4000  (public)   │   │
+   Open WebUI,   ──────────▶                                         │   │
+   cURL, etc.)   ◀──────────│  • classifies requests by type         │   │
+                        │  │  • repairs malformed messages           │   │
+                        │  │  • two-stage 429 rescue                 │   │
+                        │  │  • timeout rescue (max 3 concurrent)    │   │
+                        │  │  • context-window rescue                │   │
+                        │  │  • logs to training JSONL               │   │
+                        │  └──────────────────┬──────────────────────┘   │
+                        │                     │                          │
+                        │  ┌──────────────────▼──────────────────────┐   │
+                        │  │       LiteLLM Proxy  :4002  (internal)  │   │
+                        │  │                                         │   │
+                        │  │  • latency-based routing                │   │
+                        │  │  • provider failover + cooldowns        │   │
+                        │  │  • response caching (via Redis)         │   │
+                        │  │  • context-window pre-call checks       │   │
+                        │  └──────┬──────┬──────┬──────┬────────────┘   │
+                        │         │      │      │      │                 │
+                        └─────────┼──────┼──────┼──────┼─────────────────┘
+                                  │      │      │      │
+                        ┌─────────▼─┐ ┌──▼──┐ ┌▼────┐ ┌▼──────────────┐
+                        │  Groq     │ │NVID │ │Gemni│ │ Ollama H1     │
+                        │  Cerebras │ │ NIM │ │ etc.│ │ 10.112.30.10  │
+                        │  Mistral  │ └─────┘ └─────┘ │ :11434        │
+                        │  OpenRtr  │                  └───────────────┘
+                        │  Cloudflr │
+                        └───────────┘
+
+         Redis :6379  (response cache + provider cooldown state)
 ```
+
+## Process topology
+
+The gateway runs as three processes launched by `scripts/start.sh`:
+
+| Process | Port | Started by | Config |
+|---------|------|-----------|--------|
+| `redis:7-alpine` (Docker) | 6379 | `docker run` (container: `llm-cache`) | `maxmemory 2gb, allkeys-lru` |
+| `uv run litellm --config litellm_config.yaml` | 4002 | `uv run` | `litellm_config.yaml` |
+| `uv run python smart_router.py` | 4000 | `uv run` | env vars from `.env` |
+
+The watchdog (`scripts/watchdog.sh`) polls every 60s and restarts any crashed process.
 
 ## Request lifecycle
 
-### Step 1: Authentication
+### Step 1: Smart Router receives request (:4000)
 
-Client sends a request with `Authorization: Bearer <LITELLM_MASTER_KEY>`. LiteLLM validates the key. Invalid or missing keys are rejected with 401.
+Client sends `POST /v1/chat/completions` with `Authorization: Bearer <LITELLM_MASTER_KEY>`.
 
-### Step 2: Alias resolution
+The router:
+1. **Classifies** the request — inspects `model`, message content, payload size
+2. **Repairs** messages — fixes orphan tool results, null content, missing schema fields
+3. **Rewrites model** — e.g., large payload on `tools` → rewrite to `tools_large`
+4. **Ollama bypass** — if all Ollama hosts are down, rewrites `local` → `local_cloud` etc.
+5. **Forwards** to LiteLLM at `localhost:4002`
 
-The `model` field in the request (e.g., `"default"`, `"coding"`, `"vision"`) is resolved to a list of **deployments** — each deployment is a specific provider + model combination.
+### Step 2: LiteLLM routes to provider (:4002)
 
-```
-"coding" resolves to:
-  1. github/gpt-4.1              (GitHub Models)
-  2. github/DeepSeek-R1          (GitHub Models)
-  3. mistral/devstral-small      (Mistral)
-  4. mistral/codestral           (Mistral)
-  5. groq/qwen3-32b              (Groq)
-  6. cerebras/qwen-3-235b        (Cerebras)
-  7. cloudflare/qwen2.5-coder    (Cloudflare)
-  8. gemini/gemma-3-27b          (Google)
-```
+1. **Cache check** — hash of (alias + messages + params) looked up in Redis
+2. **Filter** — remove providers in cooldown (failed within last 60s)
+3. **Pre-call check** — filter providers whose context window can't fit the input
+4. **Select** — pick lowest-latency healthy provider
+5. **Call** — send to provider API
 
-### Step 3: Cache check
+### Step 3: Failover
 
-LiteLLM hashes the request into a cache key based on:
-- Model alias
-- Messages array
-- Parameters (temperature, max_tokens, etc.)
+If provider fails (429, 500, timeout):
+1. Provider enters 60s cooldown
+2. LiteLLM retries with next provider (up to `num_retries: 1` retry per alias)
+3. If all providers exhausted → return error to router
 
-If a matching entry exists in Redis and is within the 5-hour TTL, the cached response is returned immediately (~8-10ms) without contacting any provider.
+### Step 4: Router rescue logic
 
-### Step 4: Provider selection (latency-based routing)
-
-If not cached, the router selects a deployment:
-
-1. **Filter**: Remove deployments in cooldown (failed within last 120s)
-2. **Pre-call check**: If `enable_pre_call_checks` is on, filter out deployments whose context window can't fit the input
-3. **Select**: Pick the deployment with the **lowest rolling-average latency**
-4. **Call**: Send the request to that provider's API
-
-### Step 5: Failover
-
-If the selected provider returns an error (429 rate limit, 500 server error, timeout):
-
-1. The deployment enters a **120-second cooldown**
-2. The router **retries with the next-fastest deployment**
-3. This repeats up to **6 times** across different providers
-4. After retry 1, there's a **1-second backoff** between retries
+The router intercepts errors from LiteLLM and applies rescue layers:
 
 ```
-Request → OpenRouter (429) → Google (timeout) → Cerebras (200 OK) ✓
-           retry 1             retry 2            success
+LiteLLM returns 429
+  └─▶ 429_RESCUE stage 1: retry with model=tools_local (Ollama qwen3.5:9b)
+        ├─ 200 OK → return to client ✓
+        └─ 500 (Ollama busy) → 429_RESCUE stage 2: retry with model=tools_stable (Groq)
+              ├─ 200 OK → return to client ✓
+              └─ fail → return original 429 (last resort)
+  NOTE: spec-rag / spec-rag-nofallback skip the Ollama rescue entirely.
+        They return 429 + Retry-After: 65 header instead.
+
+LiteLLM returns 408 (provider timeout)
+  └─▶ 408_RESCUE: retry with model=big → then model=default_cloud
+        ├─ 200 OK → return to client ✓
+        └─ fail → return original 408
+  NOTE: spec-rag / spec-rag-nofallback skip big (reasoning models) → try default_cloud only.
+
+LiteLLM times out at 300s
+  └─▶ TIMEOUT_RESCUE: retry with model=tools_local (Ollama, max 3 concurrent)
+        ├─ 200 OK → return to client ✓
+        └─ fail/exception → return 504
+
+LiteLLM returns 413 (context too large)
+  └─▶ CONTEXT_RESCUE: retry with model=tools_large (128K+ models)
+        ├─ 200 OK → return to client ✓
+        └─ fail → return original 413
+
+spec-rag / spec-rag-nofallback all-providers-cooled (500 in <5s)
+  └─▶ Return 500 + Retry-After: 65 header
+        (LiteLLM exhausted all providers in <5s = all in 60s cooldown)
+        Callers should wait 65s then retry.
 ```
 
-### Step 6: Response caching
+### Step 5: Response caching
 
-Successful responses are stored in Redis with:
+Successful responses stored in Redis:
 - Key: hash of (alias + messages + params)
-- Value: full response JSON
 - TTL: 18,000 seconds (5 hours)
-- Eviction: LRU when Redis hits the 2GB memory cap
-
-### Step 7: Response
-
-The response is returned to the client in OpenAI-compatible format:
-
-```json
-{
-  "id": "...",
-  "model": "default",
-  "choices": [{
-    "message": {
-      "role": "assistant",
-      "content": "..."
-    }
-  }],
-  "usage": {
-    "prompt_tokens": 10,
-    "completion_tokens": 50
-  }
-}
-```
+- Eviction: LRU when Redis hits 2GB
 
 ## Alias system
 
-Aliases are groups of deployments curated by capability. Models within each alias are ordered by benchmark quality (best first).
+Each alias is a named group of deployments. LiteLLM picks the fastest healthy one.
 
 ```
-Alias          Purpose                    Selection criteria
-─────────────  ─────────────────────────  ──────────────────────────────────
-default        General purpose            All providers, strongest models first
-fast           Speed-critical             Small models on hardware-accelerated infra
-thinking       Deep reasoning / CoT       Models with native thinking (R1, QwQ, Gemini)
-coding         Code generation            Code-specialist models (Codestral, Devstral, GPT-4.1)
-vision         Image understanding        Models that accept image input
-tools          Function/tool calling      Models with reliable tool_use support
-big            Maximum parameters         253B, 405B, 235B, 120B models
-local          Privacy-sensitive          Ollama only, never leaves the machine
+Alias                Purpose                         Fallback chain (litellm_config.yaml)
+───────────────────  ──────────────────────────────  ─────────────────────────────────────
+tools                Tool/function calling            tools → tools_local
+tools_large          Large-context tool calling       tools_large → tools_local → default_cloud
+tools_stable         Stable tool calling (Groq)       tools_stable → tools_local
+coding               Code generation                  coding → coding_cloud
+thinking             Deep reasoning                   thinking → thinking_cloud
+big                  Large models (70B-235B)          big → tools_local → default_cloud
+default              General purpose                  (no fallback — many providers in alias)
+fast                 Speed-critical                   fast → default_cloud
+local                Ollama only (privacy)            (no cloud fallback by design)
+swebench             Long-context agent tasks         swebench → tools_local
+spec-rag             SpecRAG V1 (with Ollama sink)    spec-rag → default_cloud
+spec-rag-nofallback  SpecRAG V1 production alias      spec-rag-nofallback → default_cloud
+                     No Ollama. Fast-fail with
+                     Retry-After: 65 on exhaustion.
 ```
 
-### Provider-level aliases (for debugging)
+**spec-rag / spec-rag-nofallback provider chain (10 providers, priority order):**
 
-Each provider also has a dedicated alias for isolated testing:
+| Order | Provider | Model | Notes |
+|-------|----------|-------|-------|
+| 1 | Groq | llama-3.3-70b-versatile | Primary — ~1s, separate RPM bucket |
+| 1 | Groq | llama-4-scout-17b-16e | Separate Groq quota from llama-3.3-70b |
+| 1 | NVIDIA NIM | llama-3.3-70b-instruct | 40 RPM |
+| 1 | Gemini | gemini-2.5-flash | 1M ctx |
+| 2 | Cloudflare | llama-4-scout-17b-16e | Separate provider quota |
+| 5 | Gemini | gemini-2.5-flash-lite | Higher RPM than flash |
+| 5 | Mistral | mistral-small-latest | Independent rate limits |
+| 8 | GitHub | Llama-4-Scout-17B | 150 req/day, separate quota |
+| 10 | OpenRouter | llama-3.3-70b-instruct:free | Free tier backup |
+| 20 | Cloudflare | llama-3.3-70b-instruct-fp8-fast | Last cloud resort |
+| 50 | Ollama H1 | qwen3.5:9b | **spec-rag only** (not nofallback) |
 
-```
-openrouter_free, google_free, cerebras_free, groq_free,
-github_free, mistral_free, nvidia_free, cloudflare_free, cohere_free
-```
+**Why reasoning models are excluded from spec-rag:** gpt-oss, qwen3-235b, nemotron-ultra, and gemma4:26b all place answers in the `reasoning` field or prefix content with `<think>` blocks. SpecRAG parses `choices[0].message.content` directly and would receive empty or garbled output.
 
-## Caching architecture
+## Ollama host handling
 
-```
-Request arrives
-    │
-    ▼
-┌─────────────────┐     hit      ┌─────────────┐
-│  Compute cache   │────────────▶│ Return cached │
-│  key (hash of    │             │ response      │
-│  alias+messages  │             │ (~8ms)        │
-│  +params)        │             └─────────────┘
-└────────┬────────┘
-         │ miss
-         ▼
-┌─────────────────┐             ┌─────────────┐
-│ Route to provider│────────────▶│ Store in     │
-│ get response     │             │ Redis + return│
-│ (200-3000ms)     │             │ (TTL: 5hrs)  │
-└─────────────────┘             └─────────────┘
-```
+The router maintains a health map of Ollama hosts, probed every 30s:
 
-**Cache key components:**
-- Model alias (e.g., `"coding"`)
-- Full messages array (exact content)
-- temperature, max_tokens, and other generation params
-
-**What invalidates the cache:**
-- Different messages (even a single character change)
-- Different temperature or max_tokens
-- Different model alias
-- TTL expiry (5 hours)
-- LRU eviction (when Redis hits 2GB)
-
-**What does NOT invalidate the cache:**
-- Provider going down (cached responses still serve)
-- Restarting LiteLLM (Redis persists across LiteLLM restarts)
-- Restarting Redis (cache is ephemeral — cold start, repopulates naturally)
-
-## Failover architecture
-
-```
-                    ┌─────────────────────────────────┐
-                    │        Deployment Pool           │
-                    │   (sorted by latency, lowest     │
-                    │    first, cooled-down excluded)   │
-                    │                                   │
-Incoming request ──▶│  1. openrouter/llama-3.3  [45ms]  │──▶ try
-                    │  2. gemini/2.5-flash      [120ms] │
-                    │  3. groq/llama-3.3        [165ms] │
-                    │  4. cerebras/qwen-235b    [350ms] │
-                    │  5. nvidia/llama-3.3      [460ms] │
-                    │  6. ...                           │
-                    │                                   │
-                    │  ✗ cloudflare/llama-3.3  [COOLED] │ ← failed 90s ago
-                    └─────────────────────────────────┘
-
-On failure:
-  Provider returns 429/500/timeout
-       │
-       ▼
-  Mark deployment as failed
-  Enter 120s cooldown
-       │
-       ▼
-  Wait 1s (retry_after)
-       │
-       ▼
-  Try next deployment in latency order
-  (up to 6 retries total)
+```python
+OLLAMA_HOSTS = {
+    "OLLAMA_HOST_1": "http://10.112.30.10:11434",   # H1 — UP
+    "OLLAMA_HOST_2": "http://192.168.0.73:11434",    # H2 — DOWN
+}
 ```
 
-**Router settings:**
+When routing to an alias that uses Ollama, the router checks which hosts are healthy and builds `OLLAMA_MAP` (alias → healthy hosts). If all Ollama hosts are down, requests to Ollama-dependent aliases are rewritten to their `_cloud` counterpart.
 
-| Setting | Value | Purpose |
-|---|---|---|
-| `routing_strategy` | `latency-based-routing` | Pick fastest healthy deployment |
-| `num_retries` | 6 | Max retries across providers |
-| `retry_after` | 1s | Backoff between retries |
-| `allowed_fails` | 1 | Consecutive failures before cooldown |
-| `cooldown_time` | 120s | How long a failed deployment is excluded |
-| `timeout` | 35s | Max wait for provider response |
-| `stream_timeout` | 90s | Max wait for streaming responses |
-| `enable_pre_call_checks` | true | Filter by context window before calling |
-| `drop_params` | true | Silently drop unsupported params per provider |
+**llama.cpp (H2 port 8080):** Separate from Ollama. All entries use `timeout: 10` for fast-fail when H2 is down.
 
-## Security model
+## Key config values
+
+### `litellm_config.yaml` router_settings
+
+| Setting | Value | Reason |
+|---------|-------|--------|
+| `routing_strategy` | `latency-based-routing` | Fastest healthy provider wins |
+| `num_retries` | 1 | Higher → retry storms (4×60s=240s per failed alias) |
+| `retry_after` | 2s | Backoff between retries |
+| `allowed_fails` | 1 | Failures before cooldown |
+| `cooldown_time` | 60s | Prevents 24hr lockouts on transient errors |
+| `timeout` | 600s | LiteLLM-level timeout per request |
+| `enable_pre_call_checks` | true | Skip providers that can't fit context |
+
+### Per-model timeouts
+
+| Model / group | timeout | stream_timeout | Why |
+|---------------|---------|---------------|-----|
+| `tools_local` qwen3.5:9b | 60s | 120s | Balance: enough time for Ollama, not too long to block rescue |
+| `moophlo` / gemma4 (Ollama) | 300s | 600s | Large models — 90-150s inference time |
+| `LLAMA_CPP_HOST` entries | 10s | 20s | H2 is down; fast-fail prevents 300s silent hangs |
+| Cloudflare models | (default) | (default) | order: 90 — only used when all others exhausted |
+
+### Smart Router timeouts
+
+| Setting | Value | Location |
+|---------|-------|---------|
+| `httpx read timeout` | 300s | `smart_router.py` line ~421 |
+| Rescue concurrent limit | 3 | `_MAX_CONCURRENT_RESCUES` |
+| Cooldown flush | Redis `deployment:*:cooldown` keys | Pre-rescue in `_auto_flush_if_needed` |
+
+## Cloudflare quota management
+
+Cloudflare Workers AI has a **10,000 neuron/day** limit that exhausts in ~4 hours at high traffic. All Cloudflare models are set to `order: 90` (16 entries across all aliases) — they're the last resort, not the primary. This preserves the quota for genuine overflow situations.
+
+Quota resets at **midnight UTC**. After reset, Cloudflare responds normally and the order:90 placement means it's only reached when all higher-priority providers (Groq, Gemini, NVIDIA) are exhausted or rate-limited.
+
+## Security
 
 ```
-Client ──bearer token──▶ LiteLLM ──provider API keys──▶ Providers
-         (master key)               (from .env file)
+Client ──bearer token──▶ Smart Router ──forward──▶ LiteLLM ──provider keys──▶ Providers
+         (LITELLM_MASTER_KEY)                                  (from .env)
 ```
 
-- **Master key**: Single shared secret. All clients authenticate with this.
-- **Provider keys**: Stored in `.env` (gitignored). Loaded as environment variables. Referenced in YAML as `os.environ/KEY_NAME` — never hardcoded.
-- **No database**: `disable_database` not needed — LiteLLM runs stateless with no DB by default when no `database_url` is set.
-- **Debug mode off**: `--detailed_debug` is commented out to prevent API keys from appearing in logs.
+- Master key: all clients use the same key (`LITELLM_MASTER_KEY` in `.env`)
+- Provider keys: in `.env` (gitignored), referenced as `os.environ/KEY_NAME` in YAML
+- LiteLLM runs on `:4002` — bind to localhost only, not exposed externally
+- No database required — stateless operation
 
-## Docker topology
+## Training data
 
-```yaml
-services:
-  litellm:
-    image: ghcr.io/berriai/litellm:main-stable
-    ports: ["4000:4000"]
-    depends_on: redis (healthy)
-    env_file: .env
-    volumes: ./litellm_config.yaml → /app/config.yaml
+Every request is logged to two datasets:
 
-  redis:
-    image: redis:7-alpine
-    maxmemory: 2gb
-    eviction: allkeys-lru
-    persistence: none (ephemeral cache)
-```
+| Dataset | Path | Format |
+|---------|------|--------|
+| Routing features (68 fields) | `logs/training/routing.jsonl` | JSONL, one record per request |
+| Full conversations | `logs/training/conversations/convos.jsonl` | JSONL, request + response pairs |
 
-Both containers restart automatically (`unless-stopped`). Redis must be healthy before LiteLLM starts (`depends_on: condition: service_healthy`).
-
-## Limitations
-
-1. **No automatic capability detection**: The gateway doesn't inspect requests to auto-route vision/tools/thinking requests. Clients must pick the right alias. (Planned: smart routing middleware.)
-
-2. **No per-user rate limiting**: All clients share the same master key and the same provider quotas. Adding per-user keys requires enabling the LiteLLM database.
-
-3. **No usage tracking**: Without a database, there's no spend tracking, usage analytics, or per-key budgets. Enable PostgreSQL via `database_url` if needed.
-
-4. **Free tier volatility**: Provider free tiers can change without notice. Models can be deprecated. Monthly checks are recommended (see [MAINTENANCE.md](MAINTENANCE.md)).
-
-5. **Thinking model responses**: Some models (DeepSeek R1, QwQ, Cloudflare thinking models) return content in `reasoning_content` instead of `content`. Clients must handle both fields.
+These feed future ML-based routing improvements.

@@ -78,6 +78,7 @@ ROUTER_PORT = int(os.environ.get("ROUTER_PORT", "4000"))
 
 # Model names that trigger smart routing. All others pass through as-is.
 AUTO_ROUTE_MODELS = {"auto", "default", ""}
+LOCAL_ONLY_ALIASES = {"local", "tools_local", "llama_local"}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STRUCTURED LOGGING (JSONL for ML training data)
@@ -169,6 +170,7 @@ def log_training_sample(sample: dict):
     elif "cohere" in pb: sample["provider"] = "cohere"
     elif "cloudflare" in pb: sample["provider"] = "cloudflare"
     elif any(url in pb for url in OLLAMA_HOSTS.values() if url): sample["provider"] = "ollama"
+    elif os.environ.get("LLAMA_CPP_HOST", "") and os.environ["LLAMA_CPP_HOST"].rstrip("/v1") in pb: sample["provider"] = "llama_cpp"
     else: sample["provider"] = "unknown"
     # Rolling provider health stats
     provider_name = sample["provider"]
@@ -295,8 +297,24 @@ CIRCUIT_BREAKER_MIN_REQUESTS = 5  # need at least 5 requests to evaluate
 SOFT_TIMEOUT_SECONDS = 300    # 5 minutes (vs 600s hard limit)
 
 
-async def _auto_flush_if_needed():
-    """Flush LiteLLM cooldowns if we're in a 429 burst."""
+def _pick_stage2_alias(original_alias: str) -> str:
+    """Pick the right alias for 429 rescue stage 2.
+
+    Stage-1 rescue always tries Ollama (`tools_local`). When that fails, stage-2
+    falls back to a different cloud alias. Crucially, this must NOT be the same
+    alias as the original — otherwise we just retry the same providers that
+    already 429'd. `default_cloud` has the broadest provider diversity (Gemini,
+    Mistral, NVIDIA, OpenRouter, GitHub, Cohere) so it's the best last-resort
+    when the primary alias is itself stable/large.
+    """
+    if original_alias in {"tools_stable", "tools_stable_cloud",
+                          "tools_large", "swebench"}:
+        return "default_cloud"
+    return "tools_stable"
+
+
+async def _auto_flush_if_needed(force: bool = False):
+    """Flush LiteLLM cooldowns if we're in a 429 burst, or immediately if force=True."""
     global _last_auto_flush
     now = time.monotonic()
 
@@ -304,13 +322,24 @@ async def _auto_flush_if_needed():
     _recent_429_timestamps[:] = [t for t in _recent_429_timestamps if now - t < AUTO_FLUSH_WINDOW]
     _recent_429_timestamps.append(now)
 
-    if len(_recent_429_timestamps) >= AUTO_FLUSH_THRESHOLD and (now - _last_auto_flush) > AUTO_FLUSH_COOLDOWN:
+    should_flush = force or (
+        len(_recent_429_timestamps) >= AUTO_FLUSH_THRESHOLD
+        and (now - _last_auto_flush) > AUTO_FLUSH_COOLDOWN
+    )
+    if should_flush:
         _last_auto_flush = now
         try:
-            flush_resp = await http_client.post("/router/flush-cooldowns")
+            import redis as _redis
+            r = _redis.Redis(
+                host=os.environ.get("REDIS_HOST", "localhost"),
+                port=int(os.environ.get("REDIS_PORT", "6379")),
+            )
+            keys = r.keys("deployment:*:cooldown")
+            count = sum(1 for k in keys if r.delete(k))
             log.warning(
-                "AUTO_FLUSH  %d 429s in %ds → flushed LiteLLM cooldowns (status=%d)",
-                len(_recent_429_timestamps), AUTO_FLUSH_WINDOW, flush_resp.status_code
+                "AUTO_FLUSH  %s → cleared %d Redis cooldowns",
+                "forced pre-rescue" if force else f"{len(_recent_429_timestamps)} 429s in {AUTO_FLUSH_WINDOW}s",
+                count,
             )
             _recent_429_timestamps.clear()
         except Exception as e:
@@ -322,20 +351,29 @@ ollama_health: dict[str, bool] = {}
 OLLAMA_HOSTS = {
     "OLLAMA_HOST_1": os.environ.get("OLLAMA_HOST_1", ""),
     "OLLAMA_HOST_2": os.environ.get("OLLAMA_HOST_2", ""),
+    "OLLAMA_HOST_3": os.environ.get("OLLAMA_HOST_3", ""),
 }
 # Reverse map: URL → env var name (for matching config entries)
 OLLAMA_URL_TO_NAME = {url: name for name, url in OLLAMA_HOSTS.items() if url}
+
+llama_cpp_health: dict[str, bool] = {}
+LLAMA_CPP_HOSTS = {
+    "LLAMA_CPP_HOST": os.environ.get("LLAMA_CPP_HOST", ""),
+}
+LLAMA_CPP_URL_TO_NAME = {url: name for name, url in LLAMA_CPP_HOSTS.items() if url}
 
 
 # ── Alias → Ollama host mapping (built from config at startup) ──
 # Parsed lazily on first request to avoid import-time file reads
 _alias_ollama_map: dict[str, set[str]] | None = None
+_alias_llama_cpp_map: dict[str, set[str]] | None = None
 
 
 def _build_alias_ollama_map():
     """Parse litellm_config.yaml and build alias → set of Ollama host env vars."""
-    global _alias_ollama_map
+    global _alias_ollama_map, _alias_llama_cpp_map
     _alias_ollama_map = {}
+    _alias_llama_cpp_map = {}
     config_path = os.environ.get("CONFIG_PATH", "litellm_config.yaml")
     try:
         import yaml
@@ -345,17 +383,28 @@ def _build_alias_ollama_map():
             model = entry.get("litellm_params", {}).get("model", "")
             alias = entry.get("model_name", "")
             api_base = entry.get("litellm_params", {}).get("api_base", "")
-            # Detect Ollama entries: either ollama/ prefix or api_base pointing to Ollama host
-            is_ollama = model.startswith("ollama/") or any(
-                url in api_base for url in OLLAMA_HOSTS.values() if url
+            # Detect Ollama entries: ollama/ or ollama_chat/ prefix, or api_base pointing to Ollama host
+            is_ollama = (
+                model.startswith("ollama/")
+                or model.startswith("ollama_chat/")
+                or any(url in api_base for url in OLLAMA_HOSTS.values() if url)
             )
             if is_ollama and api_base:
                 _alias_ollama_map.setdefault(alias, set()).add(api_base)
+            is_llama_cpp = (
+                api_base == "os.environ/LLAMA_CPP_HOST"
+                or any(url in api_base for url in LLAMA_CPP_HOSTS.values() if url)
+            )
+            if is_llama_cpp and api_base:
+                _alias_llama_cpp_map.setdefault(alias, set()).add(api_base)
         log.info("OLLAMA_MAP  built alias→host map: %s",
                  {k: list(v) for k, v in _alias_ollama_map.items()})
+        log.info("LLAMA_CPP_MAP  built alias→host map: %s",
+                 {k: list(v) for k, v in _alias_llama_cpp_map.items()})
     except Exception as e:
         log.warning("OLLAMA_MAP  failed to parse config: %s", e)
         _alias_ollama_map = {}
+        _alias_llama_cpp_map = {}
 
 
 def alias_has_ollama(alias: str) -> bool:
@@ -375,6 +424,16 @@ def alias_ollama_all_down(alias: str) -> bool:
     return all(not is_ollama_host_healthy(h) for h in hosts)
 
 
+def alias_has_healthy_llama_cpp(alias: str) -> bool:
+    """Check if an alias contains at least one healthy llama.cpp deployment."""
+    if _alias_llama_cpp_map is None:
+        _build_alias_ollama_map()
+    hosts = _alias_llama_cpp_map.get(alias, set())
+    if not hosts:
+        return False
+    return any(is_llama_cpp_host_healthy(h) for h in hosts)
+
+
 def is_ollama_host_healthy(api_base_env: str) -> bool:
     """Check if an Ollama host is healthy based on the env var reference.
     api_base_env is like 'os.environ/OLLAMA_HOST_1' or the resolved URL.
@@ -388,6 +447,37 @@ def is_ollama_host_healthy(api_base_env: str) -> bool:
     if name:
         return ollama_health.get(name, True)
     return True  # not an Ollama host, assume healthy
+
+
+def is_llama_cpp_host_healthy(api_base_env: str) -> bool:
+    """Check if a llama.cpp host is healthy based on the env var reference."""
+    if api_base_env.startswith("os.environ/"):
+        env_name = api_base_env.split("/", 1)[1]
+        return llama_cpp_health.get(env_name, True)
+    name = LLAMA_CPP_URL_TO_NAME.get(api_base_env)
+    if name:
+        return llama_cpp_health.get(name, True)
+    return True
+
+
+def is_local_only_alias(alias: str) -> bool:
+    """Aliases that must never escape to cloud providers."""
+    return (
+        alias in LOCAL_ONLY_ALIASES
+        or alias.startswith("ollama/")
+        or alias.startswith("ollama_chat/")
+    )
+
+
+def pick_408_rescue_aliases(current_model: str) -> tuple[str, ...]:
+    """Timeout rescue chain for provider 408s."""
+    if current_model == "spec-rag":
+        return ("default_cloud",)
+    if current_model == "llama_local":
+        return ("local",)
+    if is_local_only_alias(current_model):
+        return ()
+    return ("big", "default_cloud")
 
 
 async def probe_ollama_hosts():
@@ -409,6 +499,24 @@ async def probe_ollama_hosts():
                 if ollama_health.get(name, True):  # was up or unknown
                     log.warning("OLLAMA  %s (%s) is DOWN (unreachable)", name, url)
                 ollama_health[name] = False
+
+        for name, url in LLAMA_CPP_HOSTS.items():
+            if not url:
+                continue
+            base = url.rstrip("/")
+            models_url = f"{base}/models" if base.endswith("/v1") else f"{base}/v1/models"
+            try:
+                resp = await probe_client.get(models_url)
+                was_up = llama_cpp_health.get(name)
+                llama_cpp_health[name] = resp.status_code == 200
+                if llama_cpp_health[name] and not was_up:
+                    log.info("LLAMA_CPP  %s (%s) is UP", name, url)
+                elif not llama_cpp_health[name] and was_up:
+                    log.warning("LLAMA_CPP  %s (%s) is DOWN", name, url)
+            except Exception:
+                if llama_cpp_health.get(name, True):
+                    log.warning("LLAMA_CPP  %s (%s) is DOWN (unreachable)", name, url)
+                llama_cpp_health[name] = False
         await asyncio.sleep(30)
 
 
@@ -417,7 +525,7 @@ async def lifespan(app: FastAPI):
     global http_client
     http_client = httpx.AsyncClient(
         base_url=LITELLM_BASE,
-        timeout=httpx.Timeout(connect=10, read=120, write=30, pool=10),
+        timeout=httpx.Timeout(connect=10, read=300, write=30, pool=10),
         limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
     )
     # Start background Ollama health probe
@@ -918,6 +1026,7 @@ async def docs_html():
     return Response(content=html, media_type="text/html")
 
 
+@app.get("/docs.json")
 @app.get("/docs/json")
 async def docs_json():
     if not _docs_available:
@@ -955,6 +1064,10 @@ async def router_health():
         "ollama_hosts": {
             name: {"url": url, "healthy": ollama_health.get(name, False)}
             for name, url in OLLAMA_HOSTS.items() if url
+        },
+        "llama_cpp_hosts": {
+            name: {"url": url, "healthy": llama_cpp_health.get(name, False)}
+            for name, url in LLAMA_CPP_HOSTS.items() if url
         },
     }
 
@@ -1016,6 +1129,10 @@ async def provider_status():
         "ollama_hosts": {
             name: {"url": url, "healthy": ollama_health.get(name, False)}
             for name, url in OLLAMA_HOSTS.items() if url
+        },
+        "llama_cpp_hosts": {
+            name: {"url": url, "healthy": llama_cpp_health.get(name, False)}
+            for name, url in LLAMA_CPP_HOSTS.items() if url
         },
         "model_identity_count": len(_model_id_to_name),
     }
@@ -1172,12 +1289,11 @@ async def proxy(request: Request, path: str):
             # rewrite to _cloud variant to avoid 60-85s dead-host timeouts.
             # For explicit local/ollama requests, fail fast with 503.
             effective_model = data.get("model", "")
-            is_local_request = (
-                effective_model == "local"
-                or effective_model.startswith("ollama/")
-            )
+            is_local_request = is_local_only_alias(effective_model)
 
-            if is_local_request and alias_ollama_all_down(effective_model):
+            if (is_local_request
+                    and alias_ollama_all_down(effective_model)
+                    and not alias_has_healthy_llama_cpp(effective_model)):
                 # Explicit local request but Ollama is down — fail fast
                 log.warning(
                     "OLLAMA_503  model=%s — all Ollama hosts down, returning 503",
@@ -1201,12 +1317,18 @@ async def proxy(request: Request, path: str):
                                     "swebench", "coding", "thinking"}
             if (effective_model in CLOUD_BYPASS_ALIASES
                     and alias_has_ollama(effective_model) and alias_ollama_all_down(effective_model)):
-                cloud_alias = f"{effective_model}_cloud"
-                data["model"] = cloud_alias
-                log.info(
-                    "OLLAMA_BYPASS  %s → %s  reason=all Ollama hosts down",
-                    effective_model, cloud_alias
-                )
+                if alias_has_healthy_llama_cpp(effective_model):
+                    log.info(
+                        "OLLAMA_BYPASS_SKIP  %s  reason=llama.cpp healthy",
+                        effective_model
+                    )
+                else:
+                    cloud_alias = f"{effective_model}_cloud"
+                    data["model"] = cloud_alias
+                    log.info(
+                        "OLLAMA_BYPASS  %s → %s  reason=all Ollama hosts down",
+                        effective_model, cloud_alias
+                    )
 
             # Respect client's stream preference (OpenAI spec: default false).
             # Only default to streaming if client didn't specify.
@@ -1355,6 +1477,8 @@ async def proxy(request: Request, path: str):
                 if current_model in OLLAMA_RETRY_ALIASES and not alias_ollama_all_down("local"):
                     ollama_retried = True
                     await resp.aclose()
+                    # Flush LiteLLM cooldowns before rescue so Ollama models aren't blocked
+                    await _auto_flush_if_needed(force=True)
                     retry_data = json.loads(body)
                     retry_data["model"] = "tools_local"
                     retry_body = json.dumps(retry_data).encode()
@@ -1370,7 +1494,22 @@ async def proxy(request: Request, path: str):
                             log.info("429_RESCUE  succeeded via Ollama (stream)")
                         else:
                             await rescue_resp.aclose()
-                            log.warning("429_RESCUE  failed (status=%d), returning original 429 (stream)", rescue_resp.status_code)
+                            stage2_alias = _pick_stage2_alias(current_model)
+                            log.warning("429_RESCUE  tools_local failed (status=%d), trying %s (stream)", rescue_resp.status_code, stage2_alias)
+                            retry_data2 = json.loads(body)
+                            retry_data2["model"] = stage2_alias
+                            retry_body2 = json.dumps(retry_data2).encode()
+                            try:
+                                req3 = http_client.build_request(request.method, url, headers=headers, content=retry_body2)
+                                rescue_resp2 = await http_client.send(req3, stream=True)
+                                if rescue_resp2.status_code == 200:
+                                    resp = rescue_resp2
+                                    log.info("429_RESCUE  succeeded via %s (stream)", stage2_alias)
+                                else:
+                                    await rescue_resp2.aclose()
+                                    log.warning("429_RESCUE  failed (status=%d), returning original 429 (stream)", rescue_resp2.status_code)
+                            except Exception as e2:
+                                log.warning("429_RESCUE  %s exception: %s (stream)", stage2_alias, e2)
                     except Exception as e:
                         log.warning("429_RESCUE  exception: %s, returning original 429 (stream)", e)
 
@@ -1387,6 +1526,15 @@ async def proxy(request: Request, path: str):
                     response_headers["X-Router-Ollama-Bypass"] = "true"
             if ollama_retried:
                 response_headers["X-Router-429-Rescue"] = "ollama"
+            # spec-rag all-providers-cooled: tell caller when providers will exit cooldown
+            _spec_rag_exhausted = chosen_alias == "spec-rag"
+            if _spec_rag_exhausted and resp.status_code == 429:
+                response_headers["Retry-After"] = "65"
+                log.warning("ALL_COOLED  %s: rate-limited, adding Retry-After: 65", chosen_alias)
+            if (_spec_rag_exhausted and resp.status_code == 500
+                    and (time.monotonic() - start) < 5.0):
+                response_headers["Retry-After"] = "65"
+                log.warning("ALL_COOLED  %s: all providers cooled, adding Retry-After: 65", chosen_alias)
 
             elapsed = time.monotonic() - start
             log.info(
@@ -1500,6 +1648,8 @@ async def proxy(request: Request, path: str):
                 current_model = json.loads(body).get("model", "") if body else ""
                 if not ollama_retried and is_chat and current_model in OLLAMA_RETRY_ALIASES and not alias_ollama_all_down("local"):
                     ollama_retried = True
+                    # Flush LiteLLM cooldowns before rescue so Ollama models aren't blocked
+                    await _auto_flush_if_needed(force=True)
                     retry_data = json.loads(body)
                     retry_data["model"] = "tools_local"
                     retry_body = json.dumps(retry_data).encode()
@@ -1515,8 +1665,22 @@ async def proxy(request: Request, path: str):
                             log_model = "tools_local"
                             log.info("429_RESCUE  succeeded via Ollama")
                         else:
-                            # Rescue failed — keep original 429 (better than Ollama 500)
-                            log.warning("429_RESCUE  failed (status=%d), returning original 429", rescue_resp.status_code)
+                            stage2_alias = _pick_stage2_alias(current_model)
+                            log.warning("429_RESCUE  tools_local failed (status=%d), trying %s", rescue_resp.status_code, stage2_alias)
+                            retry_data2 = json.loads(body)
+                            retry_data2["model"] = stage2_alias
+                            retry_body2 = json.dumps(retry_data2).encode()
+                            try:
+                                rescue_resp2 = await http_client.request(request.method, url, headers=headers, content=retry_body2)
+                                if rescue_resp2.status_code == 200:
+                                    resp = rescue_resp2
+                                    status = 200
+                                    log_model = stage2_alias
+                                    log.info("429_RESCUE  succeeded via %s", stage2_alias)
+                                else:
+                                    log.warning("429_RESCUE  failed (status=%d), returning original 429", rescue_resp2.status_code)
+                            except Exception as e2:
+                                log.warning("429_RESCUE  %s exception: %s, returning original 429", stage2_alias, e2)
                     except Exception as e:
                         log.warning("429_RESCUE  exception: %s, returning original 429", e)
                     elapsed = time.monotonic() - start
@@ -1528,7 +1692,32 @@ async def proxy(request: Request, path: str):
                         " (Ollama rescue attempted but failed)" if ollama_retried else ""
                     )
                     await _auto_flush_if_needed()
-            elif status >= 400:
+            elif status == 408 and is_chat:
+                # ── 408 rescue: LiteLLM timeout, fallbacks not triggered automatically ──
+                current_model = json.loads(body).get("model", "") if body else ""
+                _408_aliases = pick_408_rescue_aliases(current_model)
+                for rescue_alias in _408_aliases:
+                    log.warning("408_RESCUE  %s → %s (provider timeout)", current_model, rescue_alias)
+                    try:
+                        retry_408 = json.loads(body)
+                        retry_408["model"] = rescue_alias
+                        rescue_resp = await http_client.request(request.method, url, headers=headers,
+                                                                content=json.dumps(retry_408).encode())
+                        if rescue_resp.status_code == 200:
+                            resp = rescue_resp
+                            status = 200
+                            log_model = rescue_alias
+                            resp_body_override = None
+                            elapsed = time.monotonic() - start
+                            log.info("408_RESCUE  succeeded via %s (%.0fms)", rescue_alias, elapsed * 1000)
+                            break
+                        else:
+                            log.warning("408_RESCUE  %s failed (status=%d)", rescue_alias, rescue_resp.status_code)
+                    except Exception as e:
+                        log.warning("408_RESCUE  %s exception: %s", rescue_alias, e)
+                elapsed = time.monotonic() - start
+
+            if status >= 400 and status != 429:
                 error_msg = ""
                 provider_name = resp.headers.get("x-litellm-model-api-base", "unknown")
                 failed_model = resp.headers.get("x-litellm-model-id", "")
@@ -1670,6 +1859,14 @@ async def proxy(request: Request, path: str):
                 response_headers["X-Router-Reason"] = reason or ""
                 if data.get("model", "").endswith("_cloud") and not original_model.endswith("_cloud"):
                     response_headers["X-Router-Ollama-Bypass"] = "true"
+            # spec-rag all-providers-cooled: tell caller when providers will exit cooldown
+            _spec_rag_exhausted = chosen_alias == "spec-rag"
+            if _spec_rag_exhausted and status == 429:
+                response_headers["Retry-After"] = "65"
+                log.warning("ALL_COOLED  %s: rate-limited, adding Retry-After: 65", chosen_alias)
+            if _spec_rag_exhausted and status == 500 and elapsed < 5.0:
+                response_headers["Retry-After"] = "65"
+                log.warning("ALL_COOLED  %s: all providers cooled, adding Retry-After: 65", chosen_alias)
 
             # Use enriched error body if available (includes provider name)
             final_body = resp_body
@@ -1728,7 +1925,7 @@ async def proxy(request: Request, path: str):
                 else:
                     log.warning("TIMEOUT_RESCUE  failed (status=%d)", rescue_resp.status_code)
             except Exception as e:
-                log.warning("TIMEOUT_RESCUE  exception: %s", e)
+                log.warning("TIMEOUT_RESCUE  exception: %s (%s)", e or repr(e), type(e).__name__)
             finally:
                 _active_rescues = max(0, _active_rescues - 1)
         elif is_chat and current_model in OLLAMA_RETRY_ALIASES and _active_rescues >= _MAX_CONCURRENT_RESCUES:

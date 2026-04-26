@@ -122,6 +122,18 @@ ALIAS_DETAILS = {
         "streaming": True, "tool_calling": True, "vision": False, "thinking": True,
         "notes": "Led by Cerebras gpt-oss-120b, Gemini 3.1 Pro, Mistral Small 4, Nemotron-3-nano. Ollama fallback.",
     },
+    "spec-rag": {
+        "description": "SpecRAG V1 pipeline. Instruction-only models (no reasoning leakage). 14 providers, Groq/Gemini/Cerebras/GitHub/OpenRouter.",
+        "best_for": "SpecRAG indexing, document chunking, instruction-following extraction pipelines",
+        "streaming": True, "tool_calling": False, "vision": False, "thinking": False,
+        "notes": "Reasoning models excluded (no qwen3/gemma4/thinking). Retry-After:65 when all providers cooled. Falls back to big+default_cloud.",
+    },
+    "llama_local": {
+        "description": "Llama models on Ollama. Used when local Llama inference is preferred.",
+        "best_for": "Local Llama inference, privacy-sensitive Llama tasks",
+        "streaming": False, "tool_calling": False, "vision": False, "thinking": False,
+        "notes": "Falls back to big+default_cloud on failure.",
+    },
 }
 
 PROVIDER_ALIASES = {
@@ -170,7 +182,7 @@ def build_docs():
     return {
         "name": "Unified Free LLM Gateway",
         "version": "4.0",
-        "description": "OpenAI-compatible API gateway aggregating 9 free LLM providers with automatic failover and caching.",
+        "description": "OpenAI-compatible API gateway aggregating 12 free LLM providers with automatic failover and caching.",
         "base_url": f"{GATEWAY_URL}/v1",
         "endpoints": {
             "chat": {
@@ -277,7 +289,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </head>
 <body>
 <h1>Unified Free LLM Gateway</h1>
-<p class="subtitle">OpenAI-compatible API &middot; 9 providers &middot; automatic failover &middot; zero cost</p>
+<p class="subtitle">OpenAI-compatible API &middot; 12 providers &middot; automatic failover &middot; zero cost</p>
 
 <h2>Quick start</h2>
 <pre>curl %(base_url)s/v1/chat/completions \\
@@ -357,7 +369,7 @@ print(response.choices[0].message.content)</pre>
 def render_html(docs):
     alias_rows = ""
     order = ["default", "tools", "swebench", "tools_large", "coding", "thinking",
-             "vision", "fast", "big", "bench", "terminal_bench", "local", "tools_local"]
+             "vision", "fast", "big", "bench", "terminal_bench", "spec-rag", "local", "tools_local", "llama_local"]
     for name in order:
         info = docs["model_aliases"].get(name, {})
         if not info:
