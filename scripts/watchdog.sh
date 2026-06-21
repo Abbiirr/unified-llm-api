@@ -14,7 +14,7 @@
 #       or: kill $(cat .watchdog.pid)
 # =============================================================================
 
-set -euo pipefail
+set -uo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
@@ -26,7 +26,9 @@ mkdir -p "$(dirname "$LOG")"
 # Save PID
 echo $$ > "$ROOT_DIR/.watchdog.pid"
 
-log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [watchdog] $*" | tee -a "$LOG"; }
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [watchdog] $*" >> "$LOG"; }
+
+trap 'log "Watchdog exiting unexpectedly (signal/error)"' EXIT
 
 check_and_fix() {
     local issues=0
@@ -40,7 +42,7 @@ check_and_fix() {
                 --maxmemory 2gb --maxmemory-policy allkeys-lru \
                 --save "" --appendonly no 2>/dev/null
         sleep 2
-        ((issues++))
+        issues=$((issues + 1))
     fi
 
     # ── Check LiteLLM ──
@@ -65,7 +67,7 @@ check_and_fix() {
             fi
             sleep 2
         done
-        ((issues++))
+        issues=$((issues + 1))
     fi
 
     # ── Check Smart Router ──
@@ -88,7 +90,7 @@ check_and_fix() {
         log "Router restarted (PID: $!)"
         echo "$!" > "$ROOT_DIR/.router.pid"
         sleep 5
-        ((issues++))
+        issues=$((issues + 1))
     fi
 
     # ── Health summary ──
@@ -115,11 +117,12 @@ except: print('health parse error')
 log "Started (PID: $$, interval: ${CHECK_INTERVAL}s)"
 
 if [[ "$ONCE" == "--once" ]]; then
-    check_and_fix
+    check_and_fix || true
+    trap - EXIT
     exit 0
 fi
 
 while true; do
-    check_and_fix
-    sleep "$CHECK_INTERVAL"
+    check_and_fix || log "check_and_fix exited $? — continuing"
+    sleep "$CHECK_INTERVAL" || true
 done

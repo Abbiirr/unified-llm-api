@@ -79,6 +79,95 @@ ROUTER_PORT = int(os.environ.get("ROUTER_PORT", "4000"))
 # Model names that trigger smart routing. All others pass through as-is.
 AUTO_ROUTE_MODELS = {"auto", "default", ""}
 LOCAL_ONLY_ALIASES = {"local", "tools_local", "llama_local"}
+OCR_ALIAS_REWRITE_MODELS = {"ocr"}
+OCR_LEGACY_ALIAS_REWRITE_MODELS = {"deepseek-ocr", "lighton-ocr"}
+IMAGE_SAFE_ALIASES = {"vision", "ocr"}
+HIDDEN_MODEL_ALIASES = {
+    "deepseek-ocr",
+    "lighton-ocr",
+}
+
+# ── Learned auto-router (v1) ──────────────────────────────────────────────────
+# ROUTER_MODE controls how "auto"/"default" requests are routed:
+#   heuristic — classify_request() only (legacy behavior; production default)
+#   shadow    — route by heuristic, but ALSO compute + log the learned decision
+#               (zero behavior change; for safe evaluation before cut-over)
+#   learned   — route by the data-driven policy, with the heuristic as prior and
+#               fail-safe fallback (see router_policy.py)
+ROUTER_MODE = os.environ.get("ROUTER_MODE", "heuristic").strip().lower()
+# cost/quality dial à la OpenRouter Auto: 0=most capable .. 10=cheapest/fastest.
+ROUTER_COST_BIAS = int(os.environ.get("ROUTER_COST_BIAS", "5"))
+# load-spreading exploration temperature: softmax over near-best aliases so load
+# spreads across providers (0 = deterministic argmax). ~0.08 gives a gentle spread.
+try:
+    ROUTER_EXPLORATION = float(os.environ.get("ROUTER_EXPLORATION", "0.0"))
+except ValueError:
+    ROUTER_EXPLORATION = 0.0
+
+try:
+    import router_features as rf
+    import router_policy as _router_policy_mod
+except Exception:  # pragma: no cover — never let the import break the gateway
+    rf = None
+    _router_policy_mod = None
+
+
+def get_router_policy(reload: bool = False):
+    """Return the loaded RouterPolicy singleton, or None if unavailable."""
+    if _router_policy_mod is None:
+        return None
+    try:
+        return _router_policy_mod.get_policy(reload=reload)
+    except Exception as e:
+        log.warning("ROUTER_POLICY load failed: %s", e)
+        return None
+
+
+def _request_cost_bias(data: dict, headers: dict | None = None) -> int:
+    """Resolve the cost/quality dial for a request and strip it from the body.
+
+    Precedence: request body `cost_bias` > X-Router-Cost-Bias header > env default.
+    Popped from `data` so it is never forwarded to LiteLLM as an unknown param.
+    """
+    cb = data.pop("cost_bias", None)
+    if cb is None and headers:
+        cb = headers.get("x-router-cost-bias")
+    if cb is None:
+        return ROUTER_COST_BIAS
+    try:
+        return max(0, min(10, int(cb)))
+    except (TypeError, ValueError):
+        return ROUTER_COST_BIAS
+
+
+def learned_route_decision(training_features: dict, suggested_alias: str,
+                           cost_bias: int, request_has_images: bool):
+    """Compute the learned routing decision (shadow-safe). Returns Decision|None."""
+    policy = get_router_policy()
+    if policy is None or not policy.is_ready() or rf is None:
+        return None
+    try:
+        pool = policy.candidate_aliases(training_features)
+        candidates = list(pool)
+        if suggested_alias and suggested_alias not in candidates:
+            candidates.append(suggested_alias)
+        healthy = set()
+        for a in candidates:
+            ok, _, _ = _route_status(a, require_vision=request_has_images)
+            if ok:
+                healthy.add(a)
+        return policy.decide(training_features, healthy=healthy,
+                             cost_bias=cost_bias, heuristic_alias=suggested_alias,
+                             explore_temp=ROUTER_EXPLORATION,
+                             health_penalty=alias_health_penalties())
+    except Exception as e:
+        log.warning("LEARNED_ROUTE decision error: %s", e)
+        return None
+
+
+def is_public_alias(alias: str) -> bool:
+    """Return whether an alias should be advertised by /v1/models."""
+    return bool(alias) and not alias.endswith("_pool") and alias not in HIDDEN_MODEL_ALIASES
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STRUCTURED LOGGING (JSONL for ML training data)
@@ -147,8 +236,8 @@ def _categorize_error(status: int, error_msg: str) -> str:
 
 def log_training_sample(sample: dict):
     """Append a structured JSONL record for future ML router training."""
-    now = datetime.datetime.utcnow()
-    sample["timestamp"] = now.isoformat() + "Z"
+    now = datetime.datetime.now(datetime.timezone.utc)
+    sample["timestamp"] = now.isoformat().replace("+00:00", "Z")
     sample["id"] = uuid.uuid4().hex[:12]
     # Error categorization
     sample["error_category"] = _categorize_error(
@@ -231,10 +320,54 @@ def get_circuit_broken_providers() -> list[str]:
     return broken
 
 
+# ── Rolling per-alias health (live router feedback signal) ──
+# The learned router observes the outcome of its OWN recent decisions per alias
+# and penalizes aliases that are currently failing or hanging — e.g. when a
+# provider behind an alias (cerebras, Ollama) wedges, requests routed there time
+# out, this drops that alias's live health, and the router shifts to aliases
+# backed by healthy providers (groq/gemini) within seconds. Sidesteps the
+# provider-attribution gap (hung requests log provider=unknown).
+_alias_outcomes: dict[str, list[tuple[float, bool, int]]] = {}  # alias -> [(t, ok, latency_ms)]
+_ALIAS_HEALTH_WINDOW = 180     # seconds of memory
+_ALIAS_SLOW_MS = 10000         # a "success" slower than this still counts as degraded
+_ALIAS_HEALTH_WEIGHT = 0.6     # max utility penalty for a fully-degraded alias
+_ALIAS_HEALTH_MIN_OBS = 2      # require this many recent obs before penalizing
+
+
+def record_alias_outcome(alias: str, ok: bool, latency_ms: int):
+    """Record the client-visible outcome of routing to `alias` (for live health)."""
+    if not alias:
+        return
+    now = time.monotonic()
+    hist = _alias_outcomes.setdefault(alias, [])
+    hist.append((now, bool(ok), int(latency_ms or 0)))
+    cutoff = now - _ALIAS_HEALTH_WINDOW
+    if len(hist) > 50 or (hist and hist[0][0] <= cutoff):
+        _alias_outcomes[alias] = [e for e in hist if e[0] > cutoff]
+
+
+def alias_health_penalties() -> dict[str, float]:
+    """Map alias -> utility penalty [0..WEIGHT] from its recent failure/slow rate."""
+    now = time.monotonic()
+    cutoff = now - _ALIAS_HEALTH_WINDOW
+    out: dict[str, float] = {}
+    for alias, hist in _alias_outcomes.items():
+        recent = [e for e in hist if e[0] > cutoff]
+        if len(recent) < _ALIAS_HEALTH_MIN_OBS:
+            continue
+        bad = sum(1 for _, ok, lat in recent if (not ok) or lat > _ALIAS_SLOW_MS)
+        frac = bad / len(recent)
+        if frac > 0:
+            out[alias] = round(_ALIAS_HEALTH_WEIGHT * frac, 4)
+    return out
+
+
 # ── Model identity resolver ──
 # Maps opaque model ID hashes from LiteLLM to readable model names.
 # Built at startup by querying /v1/models.
 _model_id_to_name: dict[str, str] = {}
+_model_aliases: list[str] | None = None
+_alias_deployments: dict[str, list[dict]] | None = None
 
 
 async def _build_model_identity_map():
@@ -261,6 +394,141 @@ async def _build_model_identity_map():
 def resolve_model_name(model_id_hash: str) -> str:
     """Resolve an opaque model ID hash to a readable model name."""
     return _model_id_to_name.get(model_id_hash, model_id_hash)
+
+
+def get_model_aliases() -> list[str]:
+    """Load the configured model aliases from LiteLLM config, preserving order."""
+    global _model_aliases
+    if _model_aliases is not None:
+        return _model_aliases
+
+    config_path = os.environ.get("CONFIG_PATH", "litellm_config.yaml")
+    aliases: list[str] = []
+    seen: set[str] = set()
+    try:
+        import yaml
+
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f) or {}
+
+        for entry in cfg.get("model_list", []):
+            alias = entry.get("model_name", "")
+            if is_public_alias(alias) and alias not in seen:
+                seen.add(alias)
+                aliases.append(alias)
+    except Exception as e:
+        log.warning("MODEL_LIST  failed to load config: %s", e)
+        aliases = sorted({
+            "default", "fast", "thinking", "coding", "vision", "tools", "big"
+        })
+
+    _model_aliases = aliases
+    return _model_aliases
+
+
+def get_alias_deployments() -> dict[str, list[dict]]:
+    """Load alias deployments from LiteLLM config for fail-fast route checks."""
+    global _alias_deployments
+    if _alias_deployments is not None:
+        return _alias_deployments
+
+    config_path = os.environ.get("CONFIG_PATH", "litellm_config.yaml")
+    deployments: dict[str, list[dict]] = {}
+    try:
+        import yaml
+
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f) or {}
+
+        for entry in cfg.get("model_list", []):
+            alias = entry.get("model_name", "")
+            if alias:
+                deployments.setdefault(alias, []).append(entry)
+    except Exception as e:
+        log.warning("MODEL_LIST  failed to load deployments: %s", e)
+        deployments = {}
+
+    _alias_deployments = deployments
+    return _alias_deployments
+
+
+def _env_ref_available(value: str) -> bool:
+    """Return True if a literal value or os.environ/NAME reference is usable."""
+    if not value:
+        return True
+    if not isinstance(value, str) or not value.startswith("os.environ/"):
+        return True
+    env_name = value.split("/", 1)[1]
+    return bool(os.environ.get(env_name))
+
+
+def _provider_from_model(model: str) -> str:
+    """Infer provider from LiteLLM model string prefix."""
+    if model.startswith(("ollama/", "ollama_chat/")):
+        return "ollama"
+    if model.startswith("openai/"):
+        return "openai_compatible"
+    return model.split("/", 1)[0] if "/" in model else "unknown"
+
+
+def _route_status(alias: str, require_vision: bool = False) -> tuple[bool, str, int]:
+    """Check whether an alias has at least one currently usable deployment."""
+    deployments = get_alias_deployments().get(alias, [])
+    if not deployments:
+        return False, f"No deployments configured for alias '{alias}'", 0
+
+    broken = set(get_circuit_broken_providers())
+    unavailable_reasons: list[str] = []
+    usable = 0
+
+    for entry in deployments:
+        params = entry.get("litellm_params", {})
+        model_info = entry.get("model_info", {})
+        model = params.get("model", "")
+        api_key = params.get("api_key", "")
+        api_base = params.get("api_base", "")
+        provider = _provider_from_model(model)
+
+        if require_vision and model_info.get("supports_vision") is not True:
+            unavailable_reasons.append(f"{model}: not marked supports_vision")
+            continue
+        if not _env_ref_available(api_key):
+            unavailable_reasons.append(f"{model}: missing {api_key}")
+            continue
+        if not _env_ref_available(api_base):
+            unavailable_reasons.append(f"{model}: missing {api_base}")
+            continue
+        if provider == "ollama" and alias_ollama_all_down(alias) and not alias_has_healthy_llama_cpp(alias):
+            unavailable_reasons.append(f"{model}: local backend down")
+            continue
+        if provider in broken:
+            unavailable_reasons.append(f"{model}: provider circuit-broken")
+            continue
+
+        usable += 1
+
+    if usable:
+        return True, "", usable
+
+    reason = "; ".join(unavailable_reasons[:5]) or "all deployments unavailable"
+    if len(unavailable_reasons) > 5:
+        reason += f"; +{len(unavailable_reasons) - 5} more"
+    return False, reason, 0
+
+
+def build_models_response() -> dict:
+    """Return an OpenAI-compatible model listing for gateway aliases."""
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": alias,
+                "object": "model",
+                "owned_by": "gateway",
+            }
+            for alias in get_model_aliases()
+        ],
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -294,10 +562,16 @@ CIRCUIT_BREAKER_MIN_REQUESTS = 5  # need at least 5 requests to evaluate
 # ── Soft timeout with retry ──
 # If a streaming response doesn't start within this many seconds, abort and
 # retry via Ollama. Prevents clients waiting 600s for a hung provider.
-SOFT_TIMEOUT_SECONDS = 300    # 5 minutes (vs 600s hard limit)
+SOFT_TIMEOUT_SECONDS = 45     # fail fast for readiness/benchmark probes
+# Non-streaming requests: pass this as httpx read timeout so httpx properly
+# cleans up the connection (asyncio.wait_for cancellation leaks pool slots).
+NON_STREAM_TIMEOUT_SECONDS = 38
+# Image OCR requests need longer: LightOnOCR-2 warm ~70s from Docker, cloud models
+# take 25s+ each before being marked as rate-limited. Scanned PDFs have 6 pages.
+IMAGE_NON_STREAM_TIMEOUT_SECONDS = 120
 
 
-def _pick_stage2_alias(original_alias: str) -> str:
+def _pick_stage2_alias(original_alias: str, has_image_payload: bool = False) -> str:
     """Pick the right alias for 429 rescue stage 2.
 
     Stage-1 rescue always tries Ollama (`tools_local`). When that fails, stage-2
@@ -310,6 +584,10 @@ def _pick_stage2_alias(original_alias: str) -> str:
     if original_alias in {"tools_stable", "tools_stable_cloud",
                           "tools_large", "swebench"}:
         return "default_cloud"
+    if original_alias in {"tools", "tools_cloud"}:
+        return "default_cloud"
+    if has_image_payload:
+        return "ocr"
     return "tools_stable"
 
 
@@ -367,6 +645,14 @@ LLAMA_CPP_URL_TO_NAME = {url: name for name, url in LLAMA_CPP_HOSTS.items() if u
 # Parsed lazily on first request to avoid import-time file reads
 _alias_ollama_map: dict[str, set[str]] | None = None
 _alias_llama_cpp_map: dict[str, set[str]] | None = None
+
+
+def ollama_probe_headers(name: str, url: str) -> dict[str, str]:
+    """Return auth headers for Ollama-compatible wrappers that require a key."""
+    api_key = os.environ.get(f"{name}_API_KEY") or os.environ.get("LMW_API_KEY", "")
+    if api_key and ":11435" in url:
+        return {"Authorization": f"Bearer {api_key}"}
+    return {}
 
 
 def _build_alias_ollama_map():
@@ -462,6 +748,7 @@ def is_llama_cpp_host_healthy(api_base_env: str) -> bool:
 
 def is_local_only_alias(alias: str) -> bool:
     """Aliases that must never escape to cloud providers."""
+    alias = alias or ""
     return (
         alias in LOCAL_ONLY_ALIASES
         or alias.startswith("ollama/")
@@ -488,7 +775,10 @@ async def probe_ollama_hosts():
             if not url:
                 continue
             try:
-                resp = await probe_client.get(f"{url}/api/tags")
+                resp = await probe_client.get(
+                    f"{url}/api/tags",
+                    headers=ollama_probe_headers(name, url),
+                )
                 was_up = ollama_health.get(name)
                 ollama_health[name] = resp.status_code == 200
                 if ollama_health[name] and not was_up:
@@ -525,7 +815,7 @@ async def lifespan(app: FastAPI):
     global http_client
     http_client = httpx.AsyncClient(
         base_url=LITELLM_BASE,
-        timeout=httpx.Timeout(connect=10, read=300, write=30, pool=10),
+        timeout=httpx.Timeout(connect=10, read=360, write=30, pool=10),
         limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
     )
     # Start background Ollama health probe
@@ -700,6 +990,57 @@ def normalize_response(body: bytes) -> bytes:
     return body
 
 
+def _looks_like_image_refusal(text: str) -> bool:
+    """Detect provider responses that admit the model did not process the image."""
+    lower = (text or "").lower()
+    refusal_markers = (
+        "can't view",
+        "cannot view",
+        "can't process the image",
+        "cannot process the image",
+        "unable to view",
+        "unable to process the image",
+        "i do not have the ability to view images",
+        "i don't have the ability to view images",
+        "i can't see the image",
+        "i cannot see the image",
+    )
+    return any(marker in lower for marker in refusal_markers)
+
+
+def _chat_payload_is_usable(body: bytes) -> tuple[bool, str]:
+    """Validate that a non-streaming chat response has content or tool calls."""
+    try:
+        data = json.loads(body)
+    except Exception as e:
+        return False, f"invalid JSON response: {e}"
+
+    choices = data.get("choices") or []
+    if not choices:
+        return False, "missing choices"
+
+    message = choices[0].get("message") or {}
+    if message.get("tool_calls"):
+        return True, ""
+
+    content = message.get("content")
+    if isinstance(content, str) and content.strip():
+        return True, ""
+
+    # Thinking models (Qwen3, DeepSeek-R1 via LMW) put reasoning in reasoning_content;
+    # treat non-empty reasoning_content as usable even when content is empty.
+    reasoning = message.get("reasoning_content") or message.get("thinking")
+    if isinstance(reasoning, str) and reasoning.strip():
+        return True, ""
+
+    finish_reason = choices[0].get("finish_reason")
+    # length = model responded but hit max_tokens; that's a valid response,
+    # not a broken provider. Pass it through so the client can decide.
+    if finish_reason == "length":
+        return True, ""
+    return False, f"empty content/tool_calls finish_reason={finish_reason}"
+
+
 def repair_tool_schemas(data: dict) -> bool:
     """
     Fix tool/function schemas that strict providers (GitHub) reject.
@@ -744,6 +1085,17 @@ def repair_messages(data: dict) -> bool:
     repaired = False
     orphan_count = 0
     null_content_count = 0
+
+    # Pass 0a: flatten text-only content arrays to string (many providers require string content)
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list) and not any(
+            p.get("type") in ("image_url", "image") for p in content if isinstance(p, dict)
+        ):
+            msg["content"] = " ".join(
+                p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"
+            )
+            repaired = True
 
     # Pass 0: strip non-standard fields that strict providers (Mistral) reject
     ALLOWED_ASSISTANT_KEYS = {"role", "content", "tool_calls", "name", "refusal"}
@@ -1046,15 +1398,67 @@ async def docs_json():
 @app.post("/router/classify")
 async def classify_only(request: Request):
     """
-    Debug endpoint: classify a request without forwarding.
-    POST {"messages": [...], "tools": [...]}
-    Returns: {"alias": "coding", "reason": "keyword match: 'python'"}
+    Debug endpoint: classify a request without forwarding (spends no tokens).
+    POST {"messages": [...], "tools": [...], "cost_bias": 0-10 (optional)}
+    Returns the heuristic alias plus, when a learned policy is loaded, the
+    data-driven decision and the alias the gateway WOULD route to under the
+    current ROUTER_MODE — so routing can be verified cheaply.
     """
     data = await request.json()
     alias, reason = classify_request(data)
-    return {"alias": alias, "reason": reason}
+    out = {"alias": alias, "reason": reason, "mode": ROUTER_MODE}
+
+    policy = get_router_policy()
+    if policy is not None and policy.is_ready() and rf is not None:
+        try:
+            messages = data.get("messages", [])
+            user_text = extract_user_text(messages)
+            feat = {
+                "has_images": has_images(messages),
+                "has_tools": has_tools(data),
+                "tool_count": len(data.get("tools", [])),
+                "estimated_total_tokens": len(json.dumps(messages)) // 4,
+                "user_text_length": len(user_text),
+                **extract_content_features(user_text, messages),
+            }
+            cost_bias = _request_cost_bias(data)
+            decision = learned_route_decision(feat, alias, cost_bias, feat["has_images"])
+            if decision is not None:
+                out["learned"] = decision.as_dict()
+                penalties = alias_health_penalties()
+                if penalties:
+                    out["alias_health_penalty"] = penalties
+                if ROUTER_MODE == "learned" and decision.alias:
+                    out["would_route_to"] = decision.alias
+                else:
+                    out["would_route_to"] = alias
+        except Exception as e:
+            out["learned_error"] = str(e)
+    else:
+        out["would_route_to"] = alias
+    return out
 
 
+@app.post("/router/reload-policy")
+async def reload_policy():
+    """Hot-reload models/router_v1.json after a nightly rebuild (no restart)."""
+    policy = get_router_policy(reload=True)
+    if policy is None or not policy.is_ready():
+        return Response(
+            content=json.dumps({"reloaded": False, "reason": "no model file or empty table"}),
+            status_code=503, media_type="application/json",
+        )
+    return {
+        "reloaded": True,
+        "mode": ROUTER_MODE,
+        "built_at": policy.model.get("built_at"),
+        "n_train_rows": policy.model.get("n_train_rows"),
+        "buckets": len(policy.table),
+    }
+
+
+@app.get("/health")
+@app.get("/v1/health")
 @app.get("/router/health")
 async def router_health():
     """Health check for the router itself."""
@@ -1138,6 +1542,98 @@ async def provider_status():
     }
 
 
+@app.get("/health/coding")
+@app.get("/router/health/coding")
+async def coding_health():
+    """Active readiness check for the coding alias: plain chat + tool call."""
+    if http_client is None:
+        return Response(
+            content=json.dumps({"status": "unhealthy", "error": "http client not initialized"}),
+            status_code=503,
+            media_type="application/json",
+        )
+
+    master_key = os.environ.get("LITELLM_MASTER_KEY", "")
+    auth_headers = {"Authorization": f"Bearer {master_key}"} if master_key else {}
+
+    async def _check(payload: dict) -> dict:
+        started = time.monotonic()
+        try:
+            resp = await http_client.post(
+                "/v1/chat/completions",
+                headers=auth_headers,
+                json=payload,
+                timeout=30,
+            )
+            body = resp.content
+            usable, reason = _chat_payload_is_usable(body)
+            result = {
+                "status_code": resp.status_code,
+                "latency_ms": round((time.monotonic() - started) * 1000),
+                "usable": resp.status_code == 200 and usable,
+            }
+            if not result["usable"]:
+                result["reason"] = reason if resp.status_code == 200 else body[:300].decode("utf-8", "replace")
+            return result
+        except Exception as e:
+            return {
+                "status_code": None,
+                "latency_ms": round((time.monotonic() - started) * 1000),
+                "usable": False,
+                "reason": str(e),
+            }
+
+    chat_payload = {
+        "model": "coding",
+        "messages": [{"role": "user", "content": "Reply with exactly: pong"}],
+        "temperature": 0,
+        "max_tokens": 20,
+        "stream": False,
+    }
+    tool_payload = {
+        "model": "coding",
+        "messages": [{"role": "user", "content": "Use the ask_user tool to ask: continue?"}],
+        "temperature": 0,
+        "max_tokens": 80,
+        "stream": False,
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "ask_user",
+                "description": "Ask the user a question",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"question": {"type": "string"}},
+                    "required": ["question"],
+                },
+            },
+        }],
+        "tool_choice": {"type": "function", "function": {"name": "ask_user"}},
+    }
+
+    chat_result = await _check(chat_payload)
+    tool_result = await _check(tool_payload)
+    healthy = chat_result["usable"] and tool_result["usable"]
+    return Response(
+        content=json.dumps({
+            "status": "healthy" if healthy else "unhealthy",
+            "checks": {
+                "chat": chat_result,
+                "tool_call": tool_result,
+            },
+        }),
+        status_code=200 if healthy else 503,
+        media_type="application/json",
+    )
+
+
+@app.get("/v1/models")
+@app.get("/models")
+async def list_models():
+    """Expose gateway aliases without requiring LiteLLM auth."""
+    return build_models_response()
+
+
 @app.post("/router/rebuild-model-map")
 async def rebuild_model_map():
     """Force rebuild the model ID → name lookup table."""
@@ -1157,6 +1653,10 @@ async def proxy(request: Request, path: str):
     url = f"/{path}"
     headers = {k: v for k, v in request.headers.items()
                if k.lower() not in ("host", "content-length", "transfer-encoding")}
+    # Always forward with the master key so rescue paths never 401
+    _master_key = os.environ.get("LITELLM_MASTER_KEY", "")
+    if _master_key:
+        headers["authorization"] = f"Bearer {_master_key}"
     body = await request.body()
 
     original_model = None
@@ -1170,7 +1670,7 @@ async def proxy(request: Request, path: str):
     if is_chat:
         try:
             data = json.loads(body)
-            original_model = data.get("model", "default")
+            original_model = data.get("model") or "default"
 
             # Extract features for ML training log
             messages = data.get("messages", [])
@@ -1260,19 +1760,69 @@ async def proxy(request: Request, path: str):
             training_features["suggested_alias"] = suggested_alias
             training_features["suggested_reason"] = suggested_reason
 
+            # ── Feedback-loop telemetry (schema v2) ──
+            request_id = uuid.uuid4().hex
+            training_features["schema_version"] = "v2"
+            training_features["request_id"] = request_id
+            training_features["policy_mode"] = ROUTER_MODE
+            response_headers_extra = {"X-Router-Request-Id": request_id}
+
+            request_has_images = has_images(messages)
+
+            # ── Learned auto-router ──
+            # Compute the learned decision for auto/default requests. In shadow
+            # mode we log it but still route by heuristic; in learned mode we use
+            # it (with heuristic-as-prior + fail-safe fallback inside the policy).
+            cost_bias = _request_cost_bias(data, headers)
+            learned_decision = None
+            if original_model in AUTO_ROUTE_MODELS and ROUTER_MODE in ("shadow", "learned"):
+                learned_decision = learned_route_decision(
+                    training_features, suggested_alias, cost_bias, request_has_images
+                )
+                if learned_decision is not None:
+                    training_features["learned_alias"] = learned_decision.alias
+                    training_features["learned_confidence"] = learned_decision.confidence
+                    training_features["learned_utility"] = learned_decision.utility
+                    training_features["learned_reason"] = learned_decision.reason
+                    training_features["cost_bias"] = learned_decision.cost_bias
+                    training_features["candidate_aliases"] = [r[0] for r in learned_decision.ranked]
+
             if original_model in AUTO_ROUTE_MODELS:
-                chosen_alias = suggested_alias
-                reason = suggested_reason
+                if (ROUTER_MODE == "learned" and learned_decision is not None
+                        and learned_decision.alias):
+                    chosen_alias = learned_decision.alias
+                    reason = f"learned:{learned_decision.reason}"
+                else:
+                    chosen_alias = suggested_alias
+                    reason = suggested_reason
                 data["model"] = chosen_alias
                 log.info(
-                    "ROUTE  %s → %s  reason=%s",
-                    original_model, chosen_alias, reason
+                    "ROUTE  %s → %s  reason=%s  (mode=%s%s)",
+                    original_model, chosen_alias, reason, ROUTER_MODE,
+                    f", shadow={learned_decision.alias}" if (ROUTER_MODE == "shadow" and learned_decision) else "",
                 )
             else:
                 chosen_alias = original_model
                 reason = "explicit"
                 log.info("PASS   model=%s (explicit)", original_model)
 
+            # OCR aliases are operational routes, not hard dependencies on the
+            # specialist OCR models. Normalize them to the fast multimodal
+            # `vision` backend so image/text OCR requests stay within the live
+            # probe budget even when the specialist models are slow.
+            effective_model = data.get("model", "")
+            if effective_model in OCR_LEGACY_ALIAS_REWRITE_MODELS:
+                data["model"] = "ocr"
+                chosen_alias = "ocr"
+                reason = f"legacy OCR alias '{effective_model}' normalized to unified ocr"
+                log.warning("OCR_LEGACY_REWRITE  %s → ocr", effective_model)
+            elif effective_model in OCR_ALIAS_REWRITE_MODELS:
+                log.info("OCR_DIRECT  %s stays on local OCR alias", effective_model)
+            elif request_has_images and effective_model not in IMAGE_SAFE_ALIASES:
+                data["model"] = "ocr"
+                chosen_alias = "ocr"
+                reason = f"image payload requires unified OCR route, overriding '{effective_model}'"
+                log.warning("OCR_IMAGE_REWRITE  %s → ocr  reason=image payload", effective_model)
             # Large payload? Use _large alias variant (no small-context models)
             payload_chars = len(json.dumps(data.get("messages", [])))
             effective_model = data.get("model", "")
@@ -1353,8 +1903,60 @@ async def proxy(request: Request, path: str):
             if normalize_request(data):
                 log.info("NORMALIZE  sanitized tool_call_ids in request")
 
+            effective_model = data.get("model", "")
+            alias_deployments = get_alias_deployments()
+            if effective_model in alias_deployments:
+                route_ok, route_error, usable_count = _route_status(
+                    effective_model,
+                    require_vision=request_has_images,
+                )
+                if not route_ok:
+                    log.error(
+                        "ROUTE_UNAVAILABLE  model=%s reason=%s",
+                        effective_model, route_error
+                    )
+                    return Response(
+                        content=json.dumps({
+                            "error": {
+                                "message": f"No valid backend is currently available for alias '{effective_model}'.",
+                                "code": "route_unavailable",
+                                "alias": effective_model,
+                                "details": route_error,
+                            }
+                        }),
+                        status_code=503,
+                        media_type="application/json",
+                        headers={"Retry-After": "65"},
+                    )
+                log.info("ROUTE_READY  model=%s usable_deployments=%d", effective_model, usable_count)
+            elif "/" not in effective_model:
+                log.error("ROUTE_UNKNOWN  model=%s", effective_model)
+                return Response(
+                    content=json.dumps({
+                        "error": {
+                            "message": f"Unknown gateway alias '{effective_model}'.",
+                            "code": "unknown_alias",
+                            "alias": effective_model,
+                        }
+                    }),
+                    status_code=400,
+                    media_type="application/json",
+                )
+
             body = json.dumps(data).encode()
-        except (json.JSONDecodeError, KeyError):
+        except (json.JSONDecodeError, ValueError):
+            log.warning("Failed to parse chat completion request body; returning 400")
+            return Response(
+                content=json.dumps({
+                    "error": {
+                        "message": "Invalid JSON request body",
+                        "code": 400,
+                    }
+                }),
+                status_code=400,
+                media_type="application/json",
+            )
+        except KeyError:
             log.warning("Failed to parse request body, forwarding as-is")
 
     # ── Check if streaming ──
@@ -1369,11 +1971,11 @@ async def proxy(request: Request, path: str):
     # If LiteLLM returns 429 (all cloud providers exhausted), retry once with
     # tools_local (pure Ollama) before returning the error to the client.
     # This is the last-resort catch — the north star is: never 429 the client.
-    OLLAMA_RETRY_ALIASES = {"tools", "tools_large", "tools_cloud", "tools_stable",
+    OLLAMA_RETRY_ALIASES = {"tools", "tools_large", "tools_cloud", "tools_stable", "tools_stable_cloud",
                             "bench", "bench_large", "bench_cloud", "bench_stable",
                             "swebench", "swebench_cloud", "default", "default_cloud",
                             "coding", "coding_cloud", "thinking", "thinking_cloud",
-                            "terminal_bench", "big"}
+                            "terminal_bench", "big", "qwen3.6-27b"}
     ollama_retried = False
 
     # ── Circuit breaker: log proactive provider skipping ──
@@ -1381,6 +1983,13 @@ async def proxy(request: Request, path: str):
         broken = get_circuit_broken_providers()
         if broken:
             log.warning("CIRCUIT_BREAK  providers failing >50%%: %s", broken)
+
+    request_has_images = False
+    if is_chat and body:
+        try:
+            request_has_images = has_images(json.loads(body).get("messages", []))
+        except Exception:
+            request_has_images = False
 
     try:
         if is_stream:
@@ -1398,7 +2007,7 @@ async def proxy(request: Request, path: str):
                     current_model = json.loads(body).get("model", "") if body else ""
                 except Exception:
                     pass
-                can_rescue = (is_chat and current_model in OLLAMA_RETRY_ALIASES
+                can_rescue = (is_chat and not request_has_images and current_model in OLLAMA_RETRY_ALIASES
                               and not alias_ollama_all_down("local")
                               and _active_rescues < _MAX_CONCURRENT_RESCUES)
                 if can_rescue:
@@ -1410,6 +2019,8 @@ async def proxy(request: Request, path: str):
                     try:
                         retry_data = json.loads(body)
                         retry_data["model"] = "tools_local"
+                        retry_data.pop("tools", None)
+                        retry_data.pop("tool_choice", None)
                         retry_body = json.dumps(retry_data).encode()
                         req2 = http_client.build_request("POST", url, headers=headers, content=retry_body)
                         resp = await http_client.send(req2, stream=True)
@@ -1474,44 +2085,51 @@ async def proxy(request: Request, path: str):
             if resp.status_code == 429 and not ollama_retried and is_chat:
                 original_429_resp = resp
                 current_model = json.loads(body).get("model", "") if body else ""
-                if current_model in OLLAMA_RETRY_ALIASES and not alias_ollama_all_down("local"):
+                if (not request_has_images and current_model in OLLAMA_RETRY_ALIASES
+                        and not alias_ollama_all_down("local")):
                     ollama_retried = True
                     await resp.aclose()
                     # Flush LiteLLM cooldowns before rescue so Ollama models aren't blocked
                     await _auto_flush_if_needed(force=True)
                     retry_data = json.loads(body)
                     retry_data["model"] = "tools_local"
+                    retry_data.pop("tools", None)
+                    retry_data.pop("tool_choice", None)
                     retry_body = json.dumps(retry_data).encode()
                     log.warning(
                         "429_RESCUE  %s → tools_local (Ollama retry, stream)",
                         current_model
                     )
+                    _stream_rescue_ok = False
                     try:
                         req2 = http_client.build_request(request.method, url, headers=headers, content=retry_body)
-                        rescue_resp = await http_client.send(req2, stream=True)
+                        rescue_resp = await asyncio.wait_for(http_client.send(req2, stream=True), timeout=8.0)
                         if rescue_resp.status_code == 200:
                             resp = rescue_resp
+                            _stream_rescue_ok = True
                             log.info("429_RESCUE  succeeded via Ollama (stream)")
                         else:
                             await rescue_resp.aclose()
-                            stage2_alias = _pick_stage2_alias(current_model)
-                            log.warning("429_RESCUE  tools_local failed (status=%d), trying %s (stream)", rescue_resp.status_code, stage2_alias)
-                            retry_data2 = json.loads(body)
-                            retry_data2["model"] = stage2_alias
-                            retry_body2 = json.dumps(retry_data2).encode()
-                            try:
-                                req3 = http_client.build_request(request.method, url, headers=headers, content=retry_body2)
-                                rescue_resp2 = await http_client.send(req3, stream=True)
-                                if rescue_resp2.status_code == 200:
-                                    resp = rescue_resp2
-                                    log.info("429_RESCUE  succeeded via %s (stream)", stage2_alias)
-                                else:
-                                    await rescue_resp2.aclose()
-                                    log.warning("429_RESCUE  failed (status=%d), returning original 429 (stream)", rescue_resp2.status_code)
-                            except Exception as e2:
-                                log.warning("429_RESCUE  %s exception: %s (stream)", stage2_alias, e2)
-                    except Exception as e:
-                        log.warning("429_RESCUE  exception: %s, returning original 429 (stream)", e)
+                            log.warning("429_RESCUE  tools_local failed (status=%d) (stream)", rescue_resp.status_code)
+                    except (asyncio.TimeoutError, Exception) as e:
+                        log.warning("429_RESCUE  tools_local failed (%s) (stream)", type(e).__name__)
+                    if not _stream_rescue_ok:
+                        stage2_alias = _pick_stage2_alias(current_model, has_images(json.loads(body).get("messages", [])))
+                        log.warning("429_RESCUE  trying %s (stream)", stage2_alias)
+                        retry_data2 = json.loads(body)
+                        retry_data2["model"] = stage2_alias
+                        retry_body2 = json.dumps(retry_data2).encode()
+                        try:
+                            req3 = http_client.build_request(request.method, url, headers=headers, content=retry_body2)
+                            rescue_resp2 = await http_client.send(req3, stream=True)
+                            if rescue_resp2.status_code == 200:
+                                resp = rescue_resp2
+                                log.info("429_RESCUE  succeeded via %s (stream)", stage2_alias)
+                            else:
+                                await rescue_resp2.aclose()
+                                log.warning("429_RESCUE  failed (status=%d), returning original 429 (stream)", rescue_resp2.status_code)
+                        except Exception as e2:
+                            log.warning("429_RESCUE  %s exception: %s (stream)", stage2_alias, e2)
 
             # Auto-flush if streaming 429 reached client
             if resp.status_code == 429:
@@ -1524,6 +2142,11 @@ async def proxy(request: Request, path: str):
                 response_headers["X-Router-Reason"] = reason or ""
                 if data.get("model", "").endswith("_cloud") and not original_model.endswith("_cloud"):
                     response_headers["X-Router-Ollama-Bypass"] = "true"
+            if training_features:
+                response_headers["X-Router-Request-Id"] = training_features.get("request_id", "")
+                response_headers["X-Router-Mode"] = ROUTER_MODE
+                if training_features.get("learned_alias"):
+                    response_headers["X-Router-Learned-Alias"] = str(training_features.get("learned_alias"))
             if ollama_retried:
                 response_headers["X-Router-429-Rescue"] = "ollama"
             # spec-rag all-providers-cooled: tell caller when providers will exit cooldown
@@ -1560,6 +2183,10 @@ async def proxy(request: Request, path: str):
                     "served_model": served_model,
                     "served_model_name": resolve_model_name(served_model),
                     "status": resp.status_code,
+                    # final client-visible outcome (== status for stream; rescue
+                    # may have swapped the serving alias to Ollama)
+                    "final_alias": "tools_local" if ollama_retried else chosen_alias,
+                    "final_status": resp.status_code,
                     "stream": True,
                     "cache_hit": resp.headers.get("x-litellm-cache-key", "") != "",
                     "litellm_duration_ms": float(resp_duration) if resp_duration else None,
@@ -1593,6 +2220,9 @@ async def proxy(request: Request, path: str):
                         if gen_time_s > 0:
                             _training_log_data["tokens_per_second"] = round(ct / gen_time_s, 1)
                     log_training_sample(_training_log_data)
+                    record_alias_outcome(chosen_alias,
+                                         _training_log_data.get("status") == 200,
+                                         _training_log_data.get("latency_ms", 0))
 
                     # ── Full conversation log (streaming) ──
                     # Log request + extracted response metadata for successful tool-calling streams
@@ -1632,7 +2262,19 @@ async def proxy(request: Request, path: str):
                 media_type=resp.headers.get("content-type"),
             )
         else:
-            resp = await http_client.request(request.method, url, headers=headers, content=body)
+            _non_stream_timeout = IMAGE_NON_STREAM_TIMEOUT_SECONDS if request_has_images else NON_STREAM_TIMEOUT_SECONDS
+            try:
+                resp = await http_client.request(
+                    request.method, url, headers=headers, content=body,
+                    timeout=httpx.Timeout(connect=10, read=_non_stream_timeout, write=30, pool=5),
+                )
+            except httpx.ReadTimeout:
+                elapsed_so_far = time.monotonic() - start
+                log.warning(
+                    "NON_STREAM_TIMEOUT  %s timed out after %.0fs — triggering Ollama rescue",
+                    chosen_alias or original_model or "?", elapsed_so_far,
+                )
+                raise
 
             elapsed = time.monotonic() - start
 
@@ -1646,43 +2288,54 @@ async def proxy(request: Request, path: str):
                 # Save original 429 response in case rescue fails
                 original_429_resp = resp
                 current_model = json.loads(body).get("model", "") if body else ""
-                if not ollama_retried and is_chat and current_model in OLLAMA_RETRY_ALIASES and not alias_ollama_all_down("local"):
+                if (not ollama_retried and is_chat and not request_has_images
+                        and current_model in OLLAMA_RETRY_ALIASES and not alias_ollama_all_down("local")):
                     ollama_retried = True
                     # Flush LiteLLM cooldowns before rescue so Ollama models aren't blocked
                     await _auto_flush_if_needed(force=True)
                     retry_data = json.loads(body)
                     retry_data["model"] = "tools_local"
+                    retry_data.pop("tools", None)
+                    retry_data.pop("tool_choice", None)
                     retry_body = json.dumps(retry_data).encode()
                     log.warning(
                         "429_RESCUE  %s → tools_local (Ollama retry, non-stream)",
                         current_model
                     )
+                    _rescue_local_timeout = httpx.Timeout(connect=5, read=8, write=10, pool=5)
+                    _rescue_cloud_timeout = httpx.Timeout(connect=5, read=25, write=10, pool=5)
+                    _rescue_local_ok = False
                     try:
-                        rescue_resp = await http_client.request(request.method, url, headers=headers, content=retry_body)
+                        rescue_resp = await http_client.request(request.method, url, headers=headers, content=retry_body,
+                                                                timeout=_rescue_local_timeout)
                         if rescue_resp.status_code == 200:
                             resp = rescue_resp
                             status = 200
                             log_model = "tools_local"
                             log.info("429_RESCUE  succeeded via Ollama")
+                            _rescue_local_ok = True
                         else:
-                            stage2_alias = _pick_stage2_alias(current_model)
-                            log.warning("429_RESCUE  tools_local failed (status=%d), trying %s", rescue_resp.status_code, stage2_alias)
-                            retry_data2 = json.loads(body)
-                            retry_data2["model"] = stage2_alias
-                            retry_body2 = json.dumps(retry_data2).encode()
-                            try:
-                                rescue_resp2 = await http_client.request(request.method, url, headers=headers, content=retry_body2)
-                                if rescue_resp2.status_code == 200:
-                                    resp = rescue_resp2
-                                    status = 200
-                                    log_model = stage2_alias
-                                    log.info("429_RESCUE  succeeded via %s", stage2_alias)
-                                else:
-                                    log.warning("429_RESCUE  failed (status=%d), returning original 429", rescue_resp2.status_code)
-                            except Exception as e2:
-                                log.warning("429_RESCUE  %s exception: %s, returning original 429", stage2_alias, e2)
+                            log.warning("429_RESCUE  tools_local failed (status=%d)", rescue_resp.status_code)
                     except Exception as e:
-                        log.warning("429_RESCUE  exception: %s, returning original 429", e)
+                        log.warning("429_RESCUE  tools_local exception: %s", type(e).__name__)
+                    if not _rescue_local_ok:
+                        stage2_alias = _pick_stage2_alias(current_model, has_images(json.loads(body).get("messages", [])))
+                        log.warning("429_RESCUE  trying %s (non-stream)", stage2_alias)
+                        retry_data2 = json.loads(body)
+                        retry_data2["model"] = stage2_alias
+                        retry_body2 = json.dumps(retry_data2).encode()
+                        try:
+                            rescue_resp2 = await http_client.request(request.method, url, headers=headers, content=retry_body2,
+                                                                     timeout=_rescue_cloud_timeout)
+                            if rescue_resp2.status_code == 200:
+                                resp = rescue_resp2
+                                status = 200
+                                log_model = stage2_alias
+                                log.info("429_RESCUE  succeeded via %s", stage2_alias)
+                            else:
+                                log.warning("429_RESCUE  failed (status=%d), returning original 429", rescue_resp2.status_code)
+                        except Exception as e2:
+                            log.warning("429_RESCUE  %s exception: %s, returning original 429", stage2_alias, e2)
                     elapsed = time.monotonic() - start
 
                 if status == 429:
@@ -1702,7 +2355,8 @@ async def proxy(request: Request, path: str):
                         retry_408 = json.loads(body)
                         retry_408["model"] = rescue_alias
                         rescue_resp = await http_client.request(request.method, url, headers=headers,
-                                                                content=json.dumps(retry_408).encode())
+                                                                content=json.dumps(retry_408).encode(),
+                                                                timeout=httpx.Timeout(connect=5, read=15, write=10, pool=5))
                         if rescue_resp.status_code == 200:
                             resp = rescue_resp
                             status = 200
@@ -1749,7 +2403,8 @@ async def proxy(request: Request, path: str):
                         retry_data = json.loads(body)
                         retry_data["model"] = "tools_large"
                         retry_body = json.dumps(retry_data).encode()
-                        ctx_resp = await http_client.request(request.method, url, headers=headers, content=retry_body)
+                        ctx_resp = await http_client.request(request.method, url, headers=headers, content=retry_body,
+                                                            timeout=httpx.Timeout(connect=5, read=25, write=10, pool=5))
                         if ctx_resp.status_code == 200:
                             resp = ctx_resp
                             status = 200
@@ -1762,6 +2417,52 @@ async def proxy(request: Request, path: str):
                             log.warning("CTX_RESCUE  failed (status=%d)", ctx_resp.status_code)
                     except Exception as e:
                         log.warning("CTX_RESCUE  exception: %s", e)
+                    elapsed = time.monotonic() - start
+
+                # ── Tool-call generation failure rescue ──
+                # Groq (and occasionally other providers) return 400 BadRequest when the
+                # model fails to produce a valid tool call — e.g. the model embeds
+                # arguments in the function name, or the content triggers "failed_generation".
+                # LiteLLM's BadRequestErrorRetries=0 prevents auto-retry, so we catch these
+                # here and retry with tools_stable which uses more reliable tool callers.
+                _TOOL_GEN_FAIL_PATTERNS = (
+                    "tool call validation failed",
+                    "Failed to call a function",
+                    "failed_generation",
+                )
+                TOOL_RESCUE_ALIASES = {"tools", "tools_large", "tools_cloud", "bench",
+                                       "default", "swebench"}
+                current_model_for_tool_rescue = json.loads(body).get("model", "") if body else ""
+                has_tools_in_request = bool(
+                    json.loads(body).get("tools") if body else False
+                )
+                if (status == 400 and is_chat and has_tools_in_request
+                        and current_model_for_tool_rescue in TOOL_RESCUE_ALIASES
+                        and any(p in error_msg for p in _TOOL_GEN_FAIL_PATTERNS)):
+                    log.warning(
+                        "TOOL_RESCUE  %s → tools_stable (tool-gen failure: %s)",
+                        current_model_for_tool_rescue, error_msg[:80],
+                    )
+                    try:
+                        retry_tool = json.loads(body)
+                        retry_tool["model"] = "tools_stable"
+                        tool_rescue_resp = await http_client.request(
+                            request.method, url, headers=headers,
+                            content=json.dumps(retry_tool).encode(),
+                            timeout=httpx.Timeout(connect=5, read=25, write=10, pool=5),
+                        )
+                        if tool_rescue_resp.status_code == 200:
+                            resp = tool_rescue_resp
+                            status = 200
+                            log_model = "tools_stable"
+                            resp_body_override = None
+                            error_msg = ""
+                            elapsed = time.monotonic() - start
+                            log.info("TOOL_RESCUE  succeeded via tools_stable (%.0fms)", elapsed * 1000)
+                        else:
+                            log.warning("TOOL_RESCUE  failed (status=%d)", tool_rescue_resp.status_code)
+                    except Exception as e:
+                        log.warning("TOOL_RESCUE  exception: %s", e)
                     elapsed = time.monotonic() - start
 
                 if status >= 400:
@@ -1782,6 +2483,77 @@ async def proxy(request: Request, path: str):
                 if normalized is not resp_body:
                     log.info("NORMALIZE  sanitized tool_call_ids in response")
                     resp_body = normalized
+
+                usable_payload, unusable_reason = _chat_payload_is_usable(resp_body)
+                if not usable_payload:
+                    log.warning(
+                        "EMPTY_RESPONSE  model=%s reason=%s; retrying once",
+                        log_model, unusable_reason
+                    )
+                    try:
+                        retry_empty_resp = await http_client.request(
+                            request.method, url, headers=headers, content=body,
+                            timeout=httpx.Timeout(connect=10, read=_non_stream_timeout, write=30, pool=5),
+                        )
+                        retry_body = retry_empty_resp.content
+                        retry_normalized = normalize_response(retry_body)
+                        if retry_normalized is not retry_body:
+                            retry_body = retry_normalized
+                        retry_usable, retry_reason = _chat_payload_is_usable(retry_body)
+                        if retry_empty_resp.status_code == 200 and retry_usable:
+                            resp = retry_empty_resp
+                            status = 200
+                            resp_body = retry_body
+                            resp_body_override = None
+                            elapsed = time.monotonic() - start
+                            log.info("EMPTY_RESPONSE_RETRY  succeeded model=%s", log_model)
+                        else:
+                            status = 502
+                            resp_body_override = json.dumps({
+                                "error": {
+                                    "message": "Upstream returned HTTP 200 without usable content or tool calls.",
+                                    "code": "empty_upstream_response",
+                                    "alias": log_model,
+                                    "details": retry_reason if retry_empty_resp.status_code == 200 else retry_body[:300].decode("utf-8", "replace"),
+                                }
+                            }).encode()
+                            log.error(
+                                "EMPTY_RESPONSE_RETRY  failed model=%s status=%s reason=%s",
+                                log_model, retry_empty_resp.status_code, retry_reason
+                            )
+                    except Exception as e:
+                        status = 502
+                        resp_body_override = json.dumps({
+                            "error": {
+                                "message": "Upstream returned HTTP 200 without usable content or tool calls, and retry failed.",
+                                "code": "empty_upstream_response",
+                                "alias": log_model,
+                                "details": str(e),
+                            }
+                        }).encode()
+                        log.error("EMPTY_RESPONSE_RETRY  exception model=%s error=%s", log_model, e)
+
+                if request_has_images:
+                    try:
+                        resp_data_for_refusal = json.loads(resp_body)
+                        resp_msg_for_refusal = (
+                            resp_data_for_refusal.get("choices", [{}])[0].get("message", {})
+                            if resp_data_for_refusal.get("choices") else {}
+                        )
+                        resp_text_for_refusal = resp_msg_for_refusal.get("content", "") or ""
+                        if _looks_like_image_refusal(resp_text_for_refusal):
+                            status = 502
+                            log_model = chosen_alias or original_model or path
+                            resp_body_override = json.dumps({
+                                "error": {
+                                    "message": "Vision backend returned a non-OCR image refusal instead of processing the image.",
+                                    "code": "vision_refusal",
+                                    "alias": log_model,
+                                }
+                            }).encode()
+                            log.error("VISION_REFUSAL  model=%s converted 200 to 502", log_model)
+                    except Exception:
+                        pass
 
             # ── Training log (non-streaming) ──
             if training_features and is_chat:
@@ -1811,6 +2583,11 @@ async def proxy(request: Request, path: str):
                     "served_model": served_model,
                     "served_model_name": resolve_model_name(served_model),
                     "status": status,
+                    # final client-visible outcome after the rescue cascade —
+                    # log_model is the alias that ACTUALLY served (may differ from
+                    # chosen_alias if a 429/408/ctx/tool rescue swapped it)
+                    "final_alias": log_model,
+                    "final_status": status,
                     "latency_ms": round(elapsed * 1000),
                     "stream": False,
                     "cache_hit": resp.headers.get("x-litellm-cache-key", "") != "",
@@ -1823,6 +2600,7 @@ async def proxy(request: Request, path: str):
                     "finish_reason": finish,
                     "response_tool_count": len(resp_msg.get("tool_calls", [])),
                 })
+                record_alias_outcome(chosen_alias, status == 200, round(elapsed * 1000))
 
                 # ── Full conversation log for LLM fine-tuning ──
                 # Only log successful conversations (quality training data)
@@ -1830,7 +2608,7 @@ async def proxy(request: Request, path: str):
                     try:
                         req_data = json.loads(body)
                         log_conversation({
-                            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+                            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
                             "id": uuid.uuid4().hex[:12],
                             "provider": training_features.get("provider", "unknown") if training_features else "unknown",
                             "model_alias": chosen_alias,
@@ -1857,8 +2635,14 @@ async def proxy(request: Request, path: str):
                 response_headers["X-Router-Alias"] = chosen_alias
                 response_headers["X-Router-Original-Model"] = original_model or "default"
                 response_headers["X-Router-Reason"] = reason or ""
+                response_headers["X-Router-Final-Alias"] = log_model
                 if data.get("model", "").endswith("_cloud") and not original_model.endswith("_cloud"):
                     response_headers["X-Router-Ollama-Bypass"] = "true"
+            if training_features:
+                response_headers["X-Router-Request-Id"] = training_features.get("request_id", "")
+                response_headers["X-Router-Mode"] = ROUTER_MODE
+                if training_features.get("learned_alias"):
+                    response_headers["X-Router-Learned-Alias"] = str(training_features.get("learned_alias"))
             # spec-rag all-providers-cooled: tell caller when providers will exit cooldown
             _spec_rag_exhausted = chosen_alias == "spec-rag"
             if _spec_rag_exhausted and status == 429:
@@ -1875,7 +2659,7 @@ async def proxy(request: Request, path: str):
 
             return Response(
                 content=final_body,
-                status_code=resp.status_code,
+                status_code=status,
                 headers=response_headers,
                 media_type=resp.headers.get("content-type"),
             )
@@ -1889,7 +2673,7 @@ async def proxy(request: Request, path: str):
             pass
 
         # ── Timeout rescue: retry via Ollama (with concurrency limit) ──
-        can_rescue = (is_chat and current_model in OLLAMA_RETRY_ALIASES
+        can_rescue = (is_chat and not request_has_images and current_model in OLLAMA_RETRY_ALIASES
                       and not alias_ollama_all_down("local")
                       and _active_rescues < _MAX_CONCURRENT_RESCUES)
         if can_rescue:
@@ -1902,9 +2686,12 @@ async def proxy(request: Request, path: str):
             try:
                 retry_data = json.loads(body)
                 retry_data["model"] = "tools_local"
+                retry_data.pop("tools", None)
+                retry_data.pop("tool_choice", None)
                 retry_body = json.dumps(retry_data).encode()
                 rescue_resp = await http_client.request(
-                    "POST", f"/{path}", headers=headers, content=retry_body
+                    "POST", f"/{path}", headers=headers, content=retry_body,
+                    timeout=httpx.Timeout(connect=5, read=15, write=10, pool=5),
                 )
                 if rescue_resp.status_code == 200:
                     rescue_elapsed = time.monotonic() - start
@@ -1923,7 +2710,37 @@ async def proxy(request: Request, path: str):
                         media_type=rescue_resp.headers.get("content-type"),
                     )
                 else:
-                    log.warning("TIMEOUT_RESCUE  failed (status=%d)", rescue_resp.status_code)
+                    log.warning("TIMEOUT_RESCUE  failed (status=%d) — trying stage-2 cloud fallback", rescue_resp.status_code)
+                    has_imgs = has_images(json.loads(body).get("messages", []) if body else [])
+                    stage2_alias = _pick_stage2_alias(current_model, has_imgs)
+                    try:
+                        retry_data2 = json.loads(body)
+                        retry_data2["model"] = stage2_alias
+                        retry_body2 = json.dumps(retry_data2).encode()
+                        rescue_resp2 = await http_client.request(
+                            "POST", f"/{path}", headers=headers, content=retry_body2,
+                            timeout=httpx.Timeout(connect=5, read=6, write=10, pool=5),
+                        )
+                        if rescue_resp2.status_code == 200:
+                            rescue_elapsed = time.monotonic() - start
+                            log.info(
+                                "TIMEOUT_RESCUE  stage-2 succeeded via %s (%.0fms total)",
+                                stage2_alias, rescue_elapsed * 1000
+                            )
+                            response_headers2 = {k: v for k, v in rescue_resp2.headers.items()
+                                                 if k.lower() not in ("content-length", "transfer-encoding")}
+                            response_headers2["X-Router-Timeout-Rescue"] = stage2_alias
+                            _active_rescues -= 1
+                            return Response(
+                                content=rescue_resp2.content,
+                                status_code=200,
+                                headers=response_headers2,
+                                media_type=rescue_resp2.headers.get("content-type"),
+                            )
+                        else:
+                            log.warning("TIMEOUT_RESCUE  stage-2 %s failed (status=%d)", stage2_alias, rescue_resp2.status_code)
+                    except Exception as e2:
+                        log.warning("TIMEOUT_RESCUE  stage-2 %s exception: %s", stage2_alias, e2)
             except Exception as e:
                 log.warning("TIMEOUT_RESCUE  exception: %s (%s)", e or repr(e), type(e).__name__)
             finally:
@@ -1947,11 +2764,16 @@ async def proxy(request: Request, path: str):
                 "provider_base": "",
                 "served_model": "",
                 "status": 504,
+                "final_alias": chosen_alias,
+                "final_status": 504,
                 "latency_ms": round(elapsed * 1000),
                 "stream": is_stream,
                 "error_category": "timeout",
                 "error_msg": "Gateway timeout — all providers exhausted",
             })
+        # Feed the hang into live alias health so the router steers away from this
+        # alias immediately (this is the most important signal for adaptivity).
+        record_alias_outcome(chosen_alias, False, round(elapsed * 1000))
         return Response(
             content=json.dumps({"error": {"message": "Gateway timeout", "code": 504}}),
             status_code=504,

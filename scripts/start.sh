@@ -51,7 +51,7 @@ sleep 2
 
 # ── LiteLLM ──
 echo "[start] Starting LiteLLM on port 4002..."
-uv run litellm --config "$CONFIG_PATH" --port 4002 >> "$LOG_DIR/litellm/gateway.log" 2>&1 &
+nohup uv run litellm --config "$CONFIG_PATH" --port 4002 >> "$LOG_DIR/litellm/gateway.log" 2>&1 < /dev/null &
 LITELLM_PID=$!
 echo "[start] LiteLLM PID: $LITELLM_PID"
 
@@ -73,7 +73,7 @@ fi
 
 # ── Smart Router ──
 echo "[start] Starting Smart Router on port $ROUTER_PORT..."
-uv run python "$ROOT_DIR/smart_router.py" >> "$LOG_DIR/router/startup.log" 2>&1 &
+nohup uv run python "$ROOT_DIR/smart_router.py" >> "$LOG_DIR/router/startup.log" 2>&1 < /dev/null &
 ROUTER_PID=$!
 echo "[start] Router PID: $ROUTER_PID"
 

@@ -1,605 +1,495 @@
-# ML Router Training Plan
+# ML Router Plan
 
-**Goal:** replace `smart_router.py`'s rule-based classifier with a learned model that picks the best alias per request in **≤2 ms on CPU**. Fast enough to run on every incoming request without becoming a bottleneck.
-
-**Operating constraints:**
-- Router adds <2 ms to request latency (tail budget: <5 ms p99)
-- Runs on the same host as `smart_router.py` — no dedicated GPU
-- Multi-objective: optimize success rate, latency, and free-tier-quota consumption simultaneously
-- Must degrade gracefully — if model loads fail, fall back to current heuristic
+**Updated:** 2026-06-01
 
 ---
 
-## 1. Current state (2026-04-17 snapshot)
+## ✅ Implementation status (2026-06-21) — v1 shipped
 
-| Metric | Value | Verdict |
-|---|---|---|
-| Records in `routing.jsonl` | 3,123 | Phase-2 viable |
-| Daily volume | ~780/day | Phase-3 in ~3 weeks |
-| Success rate (status=200) | 81.9% | Good label diversity |
-| Cache hits | 32.2% | **Poisons training — must exclude** |
-| `has_tools=true` | 0.2% (7 rows) | **Broken detection — must fix** |
-| `provider="unknown"` | 47% | **Broken attribution — must fix** |
-| Top aliases | tools 31%, gemma4-26b-local 25%, tools_stable 10% | Severe imbalance, minority classes near-zero |
-| Time span | 4 days | Too short for weekly cycles |
+A first learned auto-router is **built and deployed in `learned` mode**. It is a
+pure-stdlib empirical/Empirical-Bayes utility table (no LightGBM/sklearn — those
+aren't installed and native deps on the live gateway were deemed too risky),
+which is the §6.1 "fallback" tier done first for safety. Heuristic-as-prior +
+softmax exploration + capability/health gating wrap it.
 
-**Current logged fields (68):** `original_model`, `routed_alias`, `suggested_alias`, `route_reason`, 7× message-count fields, 8× content flags (`has_code_blocks`, `has_urls`, etc.), `detected_languages`, `primary_task`, `estimated_input_tokens`, `payload_chars`, `temperature`, `max_tokens`, `provider`, `served_model_name`, `status`, `latency_ms`, `prompt_tokens`, `completion_tokens`, `finish_reason`, temporal (`hour_utc`, `day_of_week`), `provider_recent_error_rate`, `provider_recent_avg_latency_ms`.
+| Plan item | Status |
+|---|---|
+| `router_features.py` (shared train/serve features, §4/§6.1) | ✅ done |
+| Schema v2 telemetry (`schema_version`,`request_id`,`final_alias`,`final_status`,`learned_*`,`cost_bias`, §4.1) | ✅ done (logged now) |
+| `final_status`/`final_alias` after rescue (§4.2 #4) | ✅ done |
+| `scripts/analyze_routing_data.py`, `scripts/build_router_table.py` (§5) | ✅ done |
+| `router_policy.py` runtime scorer + safe fallback (§6.1) | ✅ done (<25µs/call, well under 2ms gate) |
+| `ROUTER_MODE=heuristic\|shadow\|learned` (§9 Phase 2) | ✅ done (deployed=learned) |
+| Cost/quality dial (`ROUTER_COST_BIAS`, OpenRouter-style) | ✅ done |
+| Exploration for counterfactuals (§7.2) | ✅ done (`ROUTER_EXPLORATION` softmax) |
+| `scripts/evaluate_router.py` chronological holdout (§8) | ✅ done — learned **+18pt** success vs heuristic on covered held-out classes |
+| `scripts/router_feedback.py` online scorecard | ✅ done |
+| Provider attribution <10% unknown (§4.2 #1) | ⛔ still ~65% unknown — provider-aware learning deferred to v2 |
+| LightGBM/ranker, LLM-judge preference labels (§6.1.1, §6.2, Phase 4) | ⛔ v2 |
+| Semantic/embedding fallback (§6.2) | ⛔ v2 |
 
----
-
-## 2. Research synthesis
-
-### 2.1 Architecture choices and their latency budgets
-
-Tested inference latencies (single request, CPU, ~1K token prompt):
-
-| Approach | Latency | Params | Accuracy ceiling | Notes |
-|---|---|---|---|---|
-| Pure rule-based (current) | **<0.1 ms** | 0 | low | deterministic, brittle |
-| LightGBM on hand-features | **~1 ms** | ~10MB | medium | best cost/quality for us |
-| MiniLM-L6-v2 + MLP head | **5–15 ms** | 22M | high | 384-dim embeddings |
-| DistilBERT + classification head | 20–30 ms | 66M | high | overkill for us |
-| ModernBERT-base + head | 30–50 ms (PyTorch) / **2–5 ms (Rust+Candle+ONNX)** | 150M | highest | vLLM Semantic Router approach |
-| DeBERTa multi-head (NVIDIA) | ~50 ms | 184M | highest | produces rich task+complexity features |
-
-**Our target:** two-stage hybrid.
-- **Stage 1 (always):** LightGBM on hand-crafted features → ~1 ms. Handles 80%+ of obvious cases.
-- **Stage 2 (only when stage 1 is low-confidence):** MiniLM embedding + small MLP → adds ~10 ms, used on <20% of traffic.
-
-### 2.2 Canonical feature taxonomy from prior art
-
-Synthesized from [NVIDIA prompt-task-and-complexity-classifier](https://huggingface.co/nvidia/prompt-task-and-complexity-classifier), [RouteLLM](https://arxiv.org/abs/2406.18665), [vLLM Semantic Router](https://vllm-semantic-router.com/), [LLMRank (2510.01234)](https://arxiv.org/html/2510.01234v1), [LLMRouterBench](https://www.emergentmind.com/topics/llmrouterbench).
-
-**Three feature families:**
-
-1. **Surface / structural** (cheap, deterministic, what we mostly have now):
-   - length stats, tool presence, image presence, system prompt length, etc.
-
-2. **Semantic / task-level** (from a small classifier, <10 ms):
-   - `task_type` in 11 categories: Open QA, Closed QA, Summarization, Text Generation, Code Generation, Chatbot, Classification, Rewrite, Brainstorming, Extraction, Other (NVIDIA taxonomy)
-   - 6 complexity dimensions: creativity, reasoning, constraints, domain_knowledge, contextual_knowledge, num_few_shots
-   - `complexity_score` = weighted ensemble (0–1)
-
-3. **Embeddings** (dense semantic, <5 ms with MiniLM):
-   - 384-dim sentence-transformer embedding of user prompt
-   - 384-dim embedding of system prompt
-   - optional: 384-dim embedding of concatenated tool schemas
-
-### 2.3 Label strategies (in order of signal strength)
-
-From RouteLLM and Anyscale tutorials, binary success/fail labels are *insufficient* — a 1–5 quality score per (prompt, model) pair is required for serious training.
-
-| Strategy | Collection | Cost | Quality |
-|---|---|---|---|
-| Status code (200/non-200) | free, automatic | 0 | low — "fast" ≠ "good" |
-| Latency | free, automatic | 0 | low |
-| LLM-judge 1–5 | offline batch via `gemma-4-26b-a4b-it:free` | <$5/10k samples | medium-high |
-| Pairwise preference (2 models, same prompt) | runs each prompt through 2 aliases + judge | ~$20/5k pairs | high (RouteLLM-grade) |
-| Human preference | manual annotation | expensive | gold |
-| Implicit retry signal | free (infer from session) | 0 | low but unbiased |
-
-**Our path:** log status+latency automatically now; add LLM-judge offline pipeline at Phase 3 entry.
-
-### 2.4 Counterfactual exploration is not optional
-
-From [Learning to Route LLMs from Bandit Feedback (2510.07429)](https://arxiv.org/html/2510.07429v1): without exploration, the learned router can only imitate the heuristic. To improve on it, we must see what *other* aliases would have done on the same prompt.
-
-Two options:
-- **Epsilon-greedy:** on 5–10% of non-critical traffic, pick a random eligible alias. Log the random assignment.
-- **A/B shadow replay:** offline, replay a sample of prompts through 2–3 aliases and LLM-judge the outputs.
-
-A/B shadow replay is safer in production. Epsilon-greedy produces cleaner data at the cost of occasional user-visible latency regressions.
+**Headline data finding:** conditioned on cleaned client-visible outcomes,
+`coding`/`tools_large`/`big`/`thinking` deliver 88–99% success at low latency,
+while the heuristic's `fast` route is only ~66% and slow — so the learned router
+chiefly fixes "short/simple → fast" and "tools → tools_large". See
+`models/router_v1.*.json` and `logs/training/reports/`.
 
 ---
 
-## 3. Exact field schema (v2)
+**Goal:** add a learned runtime router that chooses the best gateway alias per request while adding **<=2 ms p99** on the normal hot path. The current heuristic remains the fallback whenever the model is missing, low-confidence, or unhealthy.
 
-This is the schema every `routing.jsonl` row must have after the upgrades in section 7.
-
-### 3.1 Request identity
-
-| Field | Type | Why |
-|---|---|---|
-| `schema_version` | `"v2"` | Invalidates old rows on breaking change |
-| `request_id` | string | Unique per request |
-| `session_id` | string (hash of bearer-prefix + ip) | Link multi-turn conversations |
-| `timestamp` | ISO8601 UTC | |
-| `hour_utc` | int 0–23 | Cyclic feature |
-| `day_of_week` | int 0–6 | Cyclic feature |
-| `minute_of_day` | int 0–1439 | Finer temporal |
-
-### 3.2 Request structure (surface features — all cheap)
-
-| Field | Type | Current | Notes |
-|---|---|---|---|
-| `original_model` | string | ✓ | Alias the client asked for |
-| `message_count` | int | ✓ | |
-| `user_messages` / `assistant_messages` / `tool_messages` / `system_messages` | int | ✓ | |
-| `user_text_length` | int | ✓ | chars |
-| `total_conversation_chars` | int | ✓ | |
-| `payload_chars` | int | ✓ | |
-| `estimated_input_tokens` | int | ✓ | |
-| `estimated_total_tokens` | int | ✓ | |
-| `avg_message_length` | int | ✓ | |
-| `max_message_length` | int | **new** | outlier messages matter |
-| `has_images` | bool | ✓ | |
-| `image_count` | int | **new** | |
-| `has_tools` | bool | ✓ (broken) | **fix detection** |
-| `tool_count` | int | ✓ | |
-| `tool_names` | list[str] | ✓ | |
-| `tool_has_nested_objects` | bool | ✓ | |
-| `tool_rounds` | int | ✓ | prior tool-result messages |
-| `tool_schema_chars` | int | **new** | size of tool definitions |
-| `has_tool_choice` | bool | ✓ | |
-| `has_system_prompt` | bool | ✓ | |
-| `system_prompt_length` | int | ✓ | |
-| `system_is_agent` | bool | ✓ | |
-| `temperature` | float | ✓ | |
-| `max_tokens` | int \| null | ✓ | |
-| `top_p` | float \| null | **new** | |
-| `stream` | bool | ✓ | streaming changes failure modes |
-| `response_format` | enum `text`/`json_object`/`json_schema` | **new** | JSON requests route differently |
-
-### 3.3 Content flags (surface, from regex/heuristics)
-
-| Field | Type | Current |
-|---|---|---|
-| `has_code_blocks` | bool | ✓ |
-| `code_block_count` | int | ✓ |
-| `detected_languages` | list[str] | ✓ |
-| `primary_language` | string \| null | ✓ |
-| `has_urls` | bool | ✓ |
-| `has_file_paths` | bool | ✓ |
-| `has_json` | bool | ✓ |
-| `has_error_trace` | bool | ✓ |
-| `has_math` | bool | **new** | LaTeX/equations |
-| `has_non_english` | bool | **new** | unicode block heuristic |
-
-### 3.4 Semantic features (from task classifier, Phase 3+)
-
-| Field | Type | Source |
-|---|---|---|
-| `task_type_1` | enum (11 values) | Task classifier head |
-| `task_type_2` | enum (11 values) | |
-| `task_type_prob` | float 0–1 | |
-| `complexity_score` | float 0–1 | Weighted sum of 6 dims |
-| `creativity` | float 0–1 | |
-| `reasoning` | float 0–1 | |
-| `constraints` | float 0–1 | |
-| `domain_knowledge` | float 0–1 | |
-| `contextual_knowledge` | float 0–1 | |
-| `number_of_few_shots` | int | |
-
-### 3.5 Embeddings (Phase 3+, logged as base64)
-
-| Field | Type | Notes |
-|---|---|---|
-| `prompt_embedding_b64` | base64 of float16[384] | MiniLM-L6 of last user message |
-| `system_embedding_b64` | base64 of float16[384] \| null | MiniLM-L6 of system prompt |
-| `embedding_model_id` | string | e.g., `"sentence-transformers/all-MiniLM-L6-v2@1.0"` |
-
-### 3.6 Routing decision
-
-| Field | Type | Current | Notes |
-|---|---|---|---|
-| `suggested_alias` | string | ✓ | What heuristic proposed |
-| `suggested_reason` | string | ✓ | Explanation |
-| `routed_alias` | string | ✓ | What was actually dispatched |
-| `route_reason` | string | ✓ | `"explicit"` / `"classify"` / `"bypass"` / `"random_exploration"` |
-| `randomized_for_exploration` | bool | **new** | True if epsilon-greedy picked this |
-| `learned_alias` | string \| null | **new** | What the learned router *would* have picked (shadow mode) |
-| `learned_confidence` | float 0–1 \| null | **new** | Softmax max from learned model |
-
-### 3.7 Outcome — first-attempt
-
-| Field | Type | Current |
-|---|---|---|
-| `provider_base` | string | ✓ |
-| `provider` | enum | ✓ (broken) — fix regex |
-| `served_model` | string (hash) | ✓ |
-| `served_model_name` | string | ✓ |
-| `status` | int | ✓ |
-| `latency_ms` | int | ✓ |
-| `cache_hit` | bool | ✓ |
-| `prompt_tokens` | int | ✓ |
-| `completion_tokens` | int | ✓ |
-| `total_tokens` | int | ✓ |
-| `response_content_length` | int | ✓ |
-| `response_has_tool_calls` | bool | ✓ |
-| `response_tool_count` | int | ✓ |
-| `finish_reason` | enum | ✓ |
-| `error_category` | enum | ✓ |
-| `error_msg` | string | ✓ |
-
-### 3.8 Outcome — full rescue chain (NEW)
-
-| Field | Type | Notes |
-|---|---|---|
-| `rescue_path` | list[RescueStep] | Empty if first attempt succeeded |
-| `final_status` | int | Status after all rescues |
-| `final_alias` | string | Alias that finally succeeded (or last attempted) |
-| `total_latency_ms` | int | Includes rescue overhead |
-| `rescue_count` | int | Number of rescue stages hit |
-
-Where `RescueStep = { stage: string, alias: string, provider: string, status: int, latency_ms: int, error_msg: string }`.
-
-### 3.9 Quality labels (NEW, mostly Phase 3+)
-
-| Field | Type | Source | Populated |
-|---|---|---|---|
-| `is_training_sample` | bool | filter: `cache_hit=false AND status in (200, 429, 500, 504) AND provider != deprecated_provider` | log-time |
-| `llm_judge_score` | int 1–5 \| null | offline batch via `gemma-4-26b-a4b-it` | Phase 3 batch |
-| `llm_judge_model` | string \| null | | |
-| `response_is_valid_json` | bool \| null | JSON.parse attempt when `response_format=json_object` | log-time |
-| `response_tool_calls_valid` | bool \| null | JSON schema validation against tool defs | log-time |
-| `response_truncated` | bool | `finish_reason == "length"` | log-time |
-| `implicit_retry` | bool | True if next request from same session repeats this prompt within 2 min | offline job |
-
-### 3.10 Provider context (NEW)
-
-| Field | Type | Notes |
-|---|---|---|
-| `provider_recent_error_rate` | float 0–1 | ✓ existing |
-| `provider_recent_avg_latency_ms` | int | ✓ existing |
-| `provider_recent_request_count` | int | ✓ existing |
-| `provider_cooldown_at_route` | bool | **new** | was provider in 60s cooldown when selected |
-| `alias_candidate_count` | int | **new** | how many deployments were eligible for this alias |
-| `provider_deprecated_at` | ISO8601 \| null | **new** | set retroactively when a model is retired |
+This plan is based on the current local logs in `logs/training/`, the current `smart_router.py` telemetry path, and current routing research. The main conclusion changed from the older April snapshot: **we now have enough raw volume for a v1 router, but only after fixing telemetry quality.**
 
 ---
 
-## 4. Model architecture: the fast NN engine
+## 1. Current Data Inventory
 
-### 4.1 Two-stage router
+Parsed files on 2026-06-01:
 
-```
-┌─────────────────────────────────────────────────────────┐
-│ Incoming request                                         │
-└───────────┬─────────────────────────────────────────────┘
-            ▼
-┌─────────────────────────────────────────────────────────┐
-│ Stage 0: fast path (rule-based, <0.1 ms)                 │
-│   if explicit model in request → passthrough            │
-│   if has_images → vision                                │
-│   if payload_chars > 200K → tools_large                 │
-│   if private=true → local                               │
-└───────────┬─────────────────────────────────────────────┘
-            ▼ (80% of traffic exits here — was easy)
-┌─────────────────────────────────────────────────────────┐
-│ Stage 1: LightGBM classifier (~1 ms)                     │
-│   Input: 60 hand-crafted features from §3.2–§3.3        │
-│   Output: softmax over 20 aliases                       │
-│   Confidence threshold: 0.7                             │
-└───────────┬─────────────────────────────────────────────┘
-            ▼ (if max-prob ≥ 0.7 → exit with prediction)
-┌─────────────────────────────────────────────────────────┐
-│ Stage 2: MiniLM + MLP (ambiguous cases, ~10 ms)          │
-│   Input: MiniLM-L6 embedding (384d) + handcrafted       │
-│          features → 3-layer MLP                         │
-│   Output: softmax over 20 aliases + quality/latency     │
-│           regression heads                              │
-└─────────────────────────────────────────────────────────┘
+| File | Rows | Date range |
+|---|---:|---|
+| `logs/training/routing.jsonl.4` | 88,349 | 2026-03-15 to 2026-04-14 |
+| `logs/training/routing.jsonl.3` | 58,544 | 2026-04-14 to 2026-04-20 |
+| `logs/training/routing.jsonl.2` | 53,411 | 2026-04-20 to 2026-05-04 |
+| `logs/training/routing.jsonl.1` | 56,723 | 2026-05-04 to 2026-05-24 |
+| `logs/training/routing.jsonl` | 3,383 | 2026-05-24 to 2026-06-01 |
+| **Total** | **260,409** | **2026-03-15 to 2026-06-01** |
+
+Additional local data:
+
+| Artifact | Size / Count | Use |
+|---|---:|---|
+| `logs/training/conversations/convos.jsonl*` | ~2.0 GB | Offline judge/replay candidates only, not hot-path features |
+| `logs/litellm/gateway.log` | ~8.8 GB | Provider diagnostics and rescue-chain reconstruction |
+
+### 1.1 Dataset Quality
+
+| Metric | Current value | Training impact |
+|---|---:|---|
+| Raw rows | 260,409 | Enough for v1 |
+| Status 200 | 154,279 / 59.2% | Good success/failure diversity, but many failures are provider/outage behavior |
+| Cache hits | 19,515 / 7.5% | Exclude from training labels |
+| `has_tools=true` | 104,354 / 40.1% overall | Historically useful |
+| Active log `has_tools=true` | 0 / 3,383 | Blocker: active telemetry is broken |
+| `has_images=true` | 15,174 / 5.8% | Enough for OCR/vision routing signals |
+| `provider=unknown` or missing | 183,479 / 70.5% | Biggest blocker for provider-aware training |
+| Estimated trainable rows now | 68,212 / 26.2% | Enough for v1 alias model after cleanup |
+| `schema_version` | 0% | Must add before new collection |
+| `is_training_sample` | 0% | Must add before clean loaders |
+| `rescue_path` | 0% | Cannot learn rescue effectiveness yet |
+| `session_id` | 0% | Cannot infer implicit retries yet |
+| `response_format` | 0% | Cannot learn JSON-schema routing yet |
+
+### 1.2 Current Alias Distribution
+
+Top routed aliases in raw logs:
+
+| Alias | Rows |
+|---|---:|
+| `swebench` | 43,778 |
+| `spec-rag` | 41,618 |
+| `tools` | 26,337 |
+| `tools_stable_cloud` | 20,338 |
+| `<null>` | 18,300 |
+| `coding` | 16,297 |
+| `tools_cloud` | 10,713 |
+| `lighton-ocr` | 10,299 |
+| `default_cloud` | 7,156 |
+| `qwopus-4b` | 6,593 |
+| `fast` | 6,476 |
+| `terminal_bench` | 6,471 |
+
+Train v1 on **aliases**, not individual provider deployments. Provider-level choice is still mostly hidden behind LiteLLM, and the provider field is too incomplete today.
+
+### 1.3 Latency Signals From Clean Successful Rows
+
+Non-cache, provider-known, status-200 latency examples:
+
+| Alias | n | p50 | p95 | p99 |
+|---|---:|---:|---:|---:|
+| `coding` | 14,263 | 739 ms | 4,527 ms | 37,600 ms |
+| `terminal_bench` | 5,202 | 1,885 ms | 11,875 ms | 25,435 ms |
+| `tools_stable_cloud` | 5,752 | 2,341 ms | 29,628 ms | 135,525 ms |
+| `fast` | 2,825 | 2,664 ms | 34,326 ms | 124,322 ms |
+| `tools` | 14,891 | 6,161 ms | 73,132 ms | 249,641 ms |
+| `swebench` | 3,767 | 22,161 ms | 154,888 ms | 303,932 ms |
+| `qwopus-4b` | 1,330 | 223,055 ms | 292,889 ms | 299,003 ms |
+
+These numbers support a cost/latency-aware policy rather than pure success classification.
+
+---
+
+## 2. Research Summary That Changes The Plan
+
+Use these research points as design constraints:
+
+- RouteLLM trains efficient routers from preference data to balance response quality and cost, and reports large cost reductions without quality loss. For this gateway, status/latency labels are useful for v1, but preference or judge labels are needed before quality-sensitive cutover. Source: https://arxiv.org/abs/2406.18665
+- vLLM Semantic Router uses a lightweight semantic classifier, currently ModernBERT, plus routing rules around fast/reasoning paths, and emphasizes latency, token, and tool-catalog control. That validates a hybrid design: deterministic gates first, learned scoring second, semantic model only when needed. Source: https://vllm.ai/blog/2025-09-11-semantic-router
+- Not Diamond RoRF shows a production-practical random-forest router over embeddings, with pairwise model scores and tunable thresholds. Its training format requires prompt input plus per-model score columns. That is a good template for our offline judge/replay dataset, but online embeddings should wait until v2 because of hot-path latency. Source: https://github.com/Not-Diamond/RoRF
+- Bandit-feedback routing work points out the deployment reality: you only observe the model you chose. Therefore this gateway must add epsilon-greedy exploration or offline shadow replay, otherwise a learned router just imitates today's heuristic and its outages. Source: https://arxiv.org/abs/2510.07429
+- RouterBench-style evaluation treats routing as a cost/quality frontier problem, not only classification accuracy. Our evaluation must report success, latency, and quota/cost regret together. Source: https://arxiv.org/abs/2403.12031
+
+---
+
+## 3. Target Runtime Architecture
+
+### 3.1 Decision Flow
+
+```text
+incoming /v1/chat/completions
+  |
+  v
+Stage 0: deterministic safety gates (<0.1 ms)
+  - explicit non-auto model: pass through, but shadow-score it
+  - image payload: only vision/OCR-capable aliases
+  - local/privacy alias: only local-capable aliases
+  - huge context: only large-context aliases
+  - no healthy candidates: current heuristic + fail-fast rules
+  |
+  v
+Stage 1: candidate set builder (<0.2 ms)
+  - load alias capabilities from litellm_config.yaml at startup
+  - filter by tools, vision, context, JSON mode, local-only, cooldown, circuit breaker
+  - keep top candidate aliases, not provider deployments
+  |
+  v
+Stage 2: learned tabular scorer (target <=1.5 ms p99)
+  - LightGBM multiclass/ranker, or sklearn HistGradientBoosting fallback
+  - input: schema-v2 surface features + rolling provider health + alias capability features
+  - output: utility score per candidate alias
+  |
+  v
+policy layer (<0.1 ms)
+  - pick max utility unless confidence below threshold
+  - low confidence: use current heuristic
+  - optional exploration when ROUTER_EXPLORATION_RATE > 0
 ```
 
-**Latency budget per stage:**
-- Stage 0: 0.1 ms (simple booleans)
-- Stage 1: 1 ms (LightGBM predict on 60 features)
-- Stage 2: 8–12 ms (MiniLM tokenize 10 tokens/ms, forward-pass ~5 ms on CPU, MLP ~1 ms)
-- Total p50: ~1 ms (most traffic exits at stages 0 or 1)
-- Total p99: ~15 ms (worst case goes through stage 2)
+### 3.2 Utility, Not Just Classification
 
-### 4.2 Why this shape and not a single big model
+For each candidate alias `a`, predict:
 
-- A single ModernBERT over every request = 30–50 ms per request → with 20 RPS sustained that's 600–1000 ms of CPU occupied per second on routing alone. Unacceptable.
-- Stage 0 handles most obvious routing (client sent `model=tools` explicitly) with zero ML.
-- Stage 1 is a gradient-boosted model — state of the art for tabular features, <1 ms on CPU, trains on 5k samples, interpretable (SHAP values explain decisions).
-- Stage 2 is invoked only when stage 1 is uncertain, typically <20% of traffic. Amortizes embedding cost.
+```text
+success_p(a), log_latency_ms(a), error_p429(a), error_p5xx(a), quality_proxy(a)
 
-### 4.3 Serving runtime
-
-Two options:
-1. **Python `lightgbm` + `sentence-transformers`** — simplest. ~1 ms LightGBM, ~8 ms MiniLM on CPU. In-process in `smart_router.py`.
-2. **ONNX Runtime + Rust service** — `cargo` sidecar serving both models via ONNX. ~0.3 ms LightGBM, ~3 ms MiniLM on CPU. IPC adds ~0.5 ms. Total <5 ms p99. Overkill for v1, target for v2.
-
-**Start with option 1.** Migrate to option 2 only if profiling shows router latency >5% of request latency.
-
-### 4.4 Loss and training objective
-
-Multi-objective loss (trained only in Phase 4+):
-
-```
-L = L_alias + λ_q · L_quality + λ_l · L_latency
-
-where:
-  L_alias    = cross-entropy(predicted_alias, oracle_alias)   # classification
-  L_quality  = MSE(predicted_quality, observed_quality_label) # regression head
-  L_latency  = MSE(predicted_latency, observed_latency)       # regression head
-  λ_q = 0.3,  λ_l = 0.1   (tune via ablation)
+utility(a) =
+    1.00 * success_p(a)
+  + 0.30 * quality_proxy(a)
+  - 0.15 * normalized_log_latency(a)
+  - 0.25 * error_p429(a)
+  - 0.20 * error_p5xx(a)
+  - quota_penalty(a)
 ```
 
-Why regress latency and quality separately: at inference, policy can apply user-defined tradeoffs (`--cheap` mode picks low-latency-low-quality; `--best` picks highest-quality).
+For v1, `quality_proxy` is weak:
+
+```text
+quality_proxy =
+  + response_tool_calls_valid when tools are required
+  + response_is_valid_json when JSON is required
+  - response_truncated
+  - implicit_retry
+```
+
+For v2, replace or augment this with offline LLM-judge scores.
+
+### 3.3 Why Not A Neural Router First
+
+A neural/embedding router is valuable later, but not first:
+
+- Current hot-path target is <=2 ms p99. Any request-time embedding model risks exceeding that budget.
+- The current feature schema already captures strong routing signals: tools, images, prompt size, code/error/math flags, system-agent markers, alias, status, latency, and rolling provider health.
+- Current telemetry has provider and tool-detection defects. A neural model would learn those defects faster than it learns good routing.
+
+So v1 is a tabular model. v2 can add async/offline embeddings and a semantic stage only for low-confidence traffic.
 
 ---
 
-## 5. Training recipe (concrete, by phase)
+## 4. Schema v2: Add Before More Collection
 
-### 5.1 Phase 1 — Replay the heuristic (validates data pipeline)
+Implement this in `smart_router.py`, but move feature extraction into `router_features.py` so training and serving cannot drift.
 
-Needs ~1k rows. Already feasible.
+### 4.1 Required New Fields
+
+| Field | Type | Reason |
+|---|---|---|
+| `schema_version` | string, `"v2"` | Cleanly separates old broken rows from new rows |
+| `request_id` | string | Join routing, conversation, and LiteLLM logs |
+| `session_id` | hash string | Enables implicit retry detection |
+| `minute_of_day` | int | Better temporal rate-limit feature than minute-only |
+| `max_message_length` | int | Long single messages behave differently from many short messages |
+| `image_count` | int | Vision/OCR routing |
+| `tool_schema_chars` | int | Tool-catalog bloat impacts accuracy and provider failures |
+| `top_p` | float/null | Sampling setting |
+| `response_format` | `text/json_object/json_schema` | JSON routing and validation |
+| `has_math` | bool | Reasoning/routing signal |
+| `has_non_english` | bool | Provider/model capability signal |
+| `is_training_sample` | bool | Loader can filter without re-deriving |
+| `final_status` | int | Outcome after rescue |
+| `final_alias` | string | Alias that actually returned |
+| `total_latency_ms` | int | Full user-visible latency |
+| `rescue_path` | list | Learn which rescues work |
+| `provider_cooldown_at_route` | bool | Important confounder |
+| `alias_candidate_count` | int | Candidate availability feature |
+| `learned_alias` | string/null | Shadow-mode prediction |
+| `learned_confidence` | float/null | Shadow-mode confidence |
+| `randomized_for_exploration` | bool | Exclude/weight exploration separately |
+
+### 4.2 Fix Existing Fields First
+
+Blockers:
+
+1. **Provider attribution:** `provider=unknown/missing` is 70.5%. Fix provider inference from both `provider_base` and LiteLLM model identity. Rows with no provider are still usable for alias imitation, but not for provider health or provider-aware cost learning.
+2. **Tool detection:** active log has `has_tools=false` for every row since 2026-05-24. Verify against a live tool-call request and the current request body shape. This field is too important to train around.
+3. **Null routed aliases:** 18,300 rows have `routed_alias=null`, mostly older explicit-pass rows. v2 must always log both `requested_alias` and `final_alias`.
+4. **Outcome after rescue:** current rows log first-attempt-ish status, but not full rescue sequence. That mislabels cases where a bad first route was rescued successfully.
+
+---
+
+## 5. Training Dataset Construction
+
+Create `scripts/analyze_routing_data.py` and `scripts/build_router_dataset.py`.
+
+### 5.1 Clean Filters
+
+Use rows when:
 
 ```python
-# tests/replay.py
-import json, pandas as pd
-from smart_router import _classify_request, _extract_features
-rows = [json.loads(l) for l in open("logs/training/routing.jsonl")]
-correct = 0
-for r in rows:
-    pred = _classify_request(r["original_model"], _extract_features(r))
-    if pred == r["routed_alias"]:
-        correct += 1
-print(f"Heuristic replay accuracy: {correct/len(rows):.3f}")
+row["schema_version"] == "v2"
+and row["is_training_sample"] is True
+and row["cache_hit"] is False
+and row["final_status"] in (200, 400, 408, 413, 422, 429, 500, 502, 503, 504)
+and row["error_category"] != "auth"
+and row["final_alias"] in PUBLIC_ALIASES
 ```
 
-If replay accuracy <95%, feature extraction is non-deterministic between log-time and replay-time. Fix before continuing.
-
-### 5.2 Phase 2 — LightGBM on surface features (target: 5k rows, 2 weeks out)
+For old rows, build a legacy dataset only for baseline experiments:
 
 ```python
-# train_v1.py
-import json, lightgbm as lgb, numpy as np
-from sklearn.model_selection import train_test_split, StratifiedKFold
-from sklearn.preprocessing import LabelEncoder
-
-# Load clean samples only
-rows = [json.loads(l) for l in open("logs/training/clean/*.jsonl.gz")]
-rows = [r for r in rows if r["is_training_sample"]]
-
-FEATURES = [
-    "user_text_length", "tool_count", "tool_rounds", "system_prompt_length",
-    "estimated_total_tokens", "payload_chars", "max_tokens", "temperature",
-    "top_p", "image_count", "code_block_count", "tool_schema_chars",
-    "has_images", "has_tools", "has_code_blocks", "has_urls", "has_file_paths",
-    "has_json", "has_error_trace", "has_math", "has_non_english",
-    "has_tool_choice", "stream", "has_system_prompt", "system_is_agent",
-    "hour_utc", "day_of_week",
-]
-CATEGORICAL = ["primary_task", "primary_language", "response_format"]
-# one-hot CATEGORICAL → extra ~30 features
-
-X = build_matrix(rows, FEATURES, CATEGORICAL)
-le = LabelEncoder()
-y = le.fit_transform([r["routed_alias"] for r in rows])
-
-params = dict(
-    objective="multiclass",
-    num_class=len(le.classes_),
-    learning_rate=0.05,
-    num_leaves=63,
-    min_child_samples=20,
-    feature_fraction=0.8,
-    bagging_fraction=0.8,
-    class_weight="balanced",   # critical: imbalanced aliases
-)
-
-# Stratified 5-fold CV for honest accuracy estimate
-kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-scores = []
-for fold, (tr, va) in enumerate(kf.split(X, y)):
-    model = lgb.train(params, lgb.Dataset(X[tr], y[tr]),
-                      num_boost_round=500, valid_sets=[lgb.Dataset(X[va], y[va])],
-                      callbacks=[lgb.early_stopping(30)])
-    scores.append(model.best_score["valid_0"]["multi_logloss"])
-print("CV logloss:", np.mean(scores))
-
-# Final model on all data
-final = lgb.train(params, lgb.Dataset(X, y), num_boost_round=int(model.best_iteration*1.1))
-final.save_model("models/router_v1.lgb")
-
-# Export label encoder + feature schema for inference
-json.dump({"classes": le.classes_.tolist(), "features": FEATURES, "categorical": CATEGORICAL},
-          open("models/router_v1.schema.json", "w"))
+not row.get("cache_hit")
+and row.get("status") in (200, 429, 500, 503, 504)
+and row.get("provider") not in ("", "unknown", None)
+and (row.get("routed_alias") or "") in PUBLIC_ALIASES
 ```
 
-Inference contract used at serve-time:
-```python
-# smart_router.py (new code path)
-import lightgbm as lgb, json
-_model = lgb.Booster(model_file="models/router_v1.lgb")
-_schema = json.load(open("models/router_v1.schema.json"))
+Do not mix old and v2 rows in final training without a `schema_version` feature.
 
-def learned_route(features):
-    x = build_row(features, _schema)
-    probs = _model.predict(x.reshape(1, -1))[0]
-    top = probs.argmax()
-    return _schema["classes"][top], float(probs[top])
-```
+### 5.2 Labels
 
-Success criteria:
-- Replay accuracy ≥ heuristic
-- p99 latency ≤ 3 ms
-- Cross-validated logloss ≤ 1.0
+For v1:
 
-### 5.3 Phase 3 — Embedding model + stage-2 fallback (target: 15k rows, 3 weeks out)
+- `success_label`: `final_status == 200`
+- `latency_label`: `log1p(total_latency_ms)`
+- `rate_limit_label`: `final_status == 429`
+- `server_error_label`: `final_status in (500, 502, 503, 504)`
+- `selected_alias`: `final_alias`
+- `heuristic_alias`: current `suggested_alias`
 
-Prerequisite: task classifier running, embeddings being logged at request-time.
+For v2:
+
+- `llm_judge_score`: 1 to 5 from offline replay
+- `pairwise_winner`: alias A, alias B, or tie
+- `implicit_retry`: same session repeats similar prompt within 2 minutes
+
+---
+
+## 6. Model Plan
+
+### 6.1 V1: Tabular Alias Scorer
+
+Train one of these, in this order:
+
+1. **LightGBM LambdaRank/ranker** if LightGBM is accepted as a dependency.
+2. **LightGBM multiclass classifier + latency/error regressors** if ranking setup is too slow to build.
+3. **sklearn HistGradientBoosting** fallback if avoiding native dependencies matters more than accuracy.
+
+Features:
+
+- Request structure: message counts, role counts, user/system lengths, max message length, total chars, estimated tokens.
+- Tool features: `has_tools`, `tool_count`, `tool_schema_chars`, nested schemas, prior tool rounds, tool choice.
+- Content flags: code block count, primary language, URLs, file paths, JSON, error trace, math, non-English.
+- Mode flags: stream, response format, temperature, max tokens, top_p.
+- Capability flags per candidate alias: supports tools, supports vision, supports large context, local/cloud, current candidate count.
+- Health features: provider recent error rate, avg latency, cooldown state.
+- Temporal features: hour sin/cos, day-of-week sin/cos, minute-of-day sin/cos.
+
+Artifacts:
+
+| Artifact | Purpose |
+|---|---|
+| `models/router_v1.model` | trained model |
+| `models/router_v1.schema.json` | feature order, categorical maps, alias classes |
+| `models/router_v1.metrics.json` | evaluation report and gates |
+| `router_features.py` | shared feature extraction for logging, training, and serving |
+| `router_model.py` | load model, score candidates, fallback safely |
+
+Runtime contract:
 
 ```python
-# train_v2.py
-import numpy as np, torch, torch.nn as nn
-from datasets import Dataset
-from sentence_transformers import SentenceTransformer
-
-emb = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-rows = load_clean_rows()
-
-# Build features: hand-crafted + 384d embedding + 384d system embedding
-X_hand = build_hand_features(rows)       # [N, ~60]
-X_emb  = np.stack([decode_b64(r["prompt_embedding_b64"]) for r in rows])  # [N, 384]
-X_sys  = np.stack([decode_b64(r["system_embedding_b64"] or ZERO384) for r in rows])
-X = np.concatenate([X_hand, X_emb, X_sys], axis=1)  # [N, ~828]
-
-class Router(nn.Module):
-    def __init__(self, in_dim, n_classes):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(in_dim, 256), nn.GELU(), nn.Dropout(0.1),
-            nn.Linear(256, 128), nn.GELU(), nn.Dropout(0.1),
-        )
-        self.alias_head   = nn.Linear(128, n_classes)
-        self.quality_head = nn.Linear(128, 1)   # 1–5 from LLM judge
-        self.latency_head = nn.Linear(128, 1)   # log-ms
-    def forward(self, x):
-        h = self.mlp(x)
-        return self.alias_head(h), self.quality_head(h), self.latency_head(h)
-
-# Multi-objective training loop (standard PyTorch, not shown in full)
-# Save as ONNX for 2–5× speedup at serving:
-torch.onnx.export(model, dummy_input, "models/router_v2.onnx",
-                  input_names=["features"], output_names=["alias","quality","latency"],
-                  opset_version=17, dynamic_axes={"features":{0:"batch"}})
+decision = learned_router.route(features, candidates)
+if not decision.ok or decision.confidence < ROUTER_MIN_CONFIDENCE:
+    alias = heuristic_alias
+else:
+    alias = decision.alias
 ```
 
-Serve via `onnxruntime`:
-```python
-import onnxruntime as ort
-_sess = ort.InferenceSession("models/router_v2.onnx",
-                             providers=["CPUExecutionProvider"])
-alias_logits, q, lat = _sess.run(None, {"features": x.astype(np.float32)})
-```
+### 6.2 V2: Semantic Fallback For Ambiguous Requests
 
-Success criteria:
-- Stage-2 p99 latency ≤ 15 ms
-- Stage-1 + stage-2 combined beats LightGBM-only on minority aliases (target: +5 pp macro-F1)
-- Calibration ECE ≤ 5%
+Only after v1 is stable:
 
-### 5.4 Phase 4 — Preference labels via LLM judge (target: 30k rows + 5k judged pairs)
-
-Offline batch: pick N=5,000 prompts from `routing.jsonl`, replay each through 2–3 aliases, score each response with `gemma-4-26b-a4b-it:free` using:
-
-```
-You are judging which response better answers the user's request.
-Score each response 1–5 where:
-  5 = fully correct, complete, well-structured
-  4 = correct, minor issues
-  3 = partially correct
-  2 = off-topic or wrong
-  1 = unusable
-
-Rubric: correctness, completeness, structure, tool-call validity (if applicable).
-Return JSON: {"response_a_score": int, "response_b_score": int, "winner": "a"|"b"|"tie", "reason": str}
-```
-
-Build preference pairs, retrain stage-2 with pairwise loss (Bradley-Terry or directly as triplet):
-
-```
-L_pref = -log σ(score_winner - score_loser)
-```
-
-### 5.5 Phase 5 — Shadow deploy, then A/B, then cutover
-
-```
-Week 1: shadow mode — log learned_alias alongside routed_alias on 100% of traffic
-Week 2: 10% A/B — if learned_alias ≠ routed_alias and learned_confidence > 0.8, serve learned
-Week 3: evaluate — require ≥95% of heuristic's success rate AND ≥10% latency improvement
-Week 4: 100% cutover — keep heuristic as fallback if model inference errors
-```
+- Precompute prompt embeddings offline for training.
+- Do **not** compute embeddings for every request on day one.
+- Add an optional low-confidence path using MiniLM or ModernBERT only when Stage 2 confidence is below threshold and `ROUTER_SEMANTIC_FALLBACK=1`.
+- Measure router p99 separately. If semantic fallback pushes router p99 over 15 ms, keep it shadow-only.
 
 ---
 
-## 6. Data quality fixes — do these FIRST
+## 7. Exploration And Counterfactual Data
 
-These are blockers. No training can start until they're done.
+We need counterfactuals because current logs only show the chosen alias.
 
-- [ ] **F1: Fix `provider=unknown` (47% → <10%).** In `smart_router.py`, `_infer_provider` uses a regex that misses new model IDs like `openai/gpt-oss-120b`. Audit the regex against all 322 entries in `MODEL_MAP`.
-- [ ] **F2: Fix `has_tools` detection (0.2% → realistic).** Almost certainly `_extract_features` is checking the wrong field (e.g. looking for `tools` in the top-level request body when it's nested under a different key). Verify against a live tool-call request.
-- [ ] **F3: Add `is_training_sample` filter.** One-liner in the logger: `row["is_training_sample"] = not row["cache_hit"] and row["status"] in (200, 429, 500, 503, 504) and row["error_category"] != "auth"`.
-- [ ] **F4: Log full `rescue_path`.** Currently only first-attempt outcome is captured. Extend the rescue functions in `smart_router.py` to append to a list, dump on final response.
-- [ ] **F5: `schema_version: "v2"`.** Add to every row. Training loaders filter by version.
-- [ ] **F6: Daily log rotation + gzip.** `routing.jsonl` → `routing-YYYY-MM-DD.jsonl.gz`, kept 90 days.
-- [ ] **F7: `session_id`.** Derive from `hash(bearer_prefix + client_ip)` or request header. Enables retry detection.
-- [ ] **F8: Epsilon-greedy hook.** Env `ROUTER_EXPLORATION_RATE=0.0` by default. When non-zero, on that fraction of non-critical requests pick a random eligible alias; log `randomized_for_exploration=true`.
+### 7.1 Safer First Step: Offline Shadow Replay
 
-Order of work: F1 → F2 → F3 → F5 → F6 → F4 → F7 → F8. F1/F2 unblock everything else.
+Nightly job:
 
----
+1. Sample 500 to 2,000 requests from clean non-sensitive v2 rows.
+2. Replay each prompt through 2 or 3 eligible aliases.
+3. Save model outputs, latency, status, tokens, and tool/JSON validity.
+4. Judge a subset with a cheap reliable judge model.
+5. Store as `logs/training/replay/replay-YYYY-MM-DD.jsonl.gz`.
 
-## 7. Data volume thresholds
+This gives pairwise labels without user-visible regressions.
 
-| Phase | Threshold | ETA (at ~780 clean samples/day after F3 filter) |
-|---|---|---|
-| 1 — heuristic replay | 1k rows | ✅ today |
-| 2 — LightGBM baseline | 5k rows, ≥200 per top-10 aliases | ~2 weeks |
-| 3 — MiniLM + MLP | 15k rows, exploration data present | ~4 weeks |
-| 4 — Preference router | 30k rows + 5k LLM-judge labels | ~2 months + $5–20 budget |
-| 5 — Production cutover | A/B data passes gates (see §5.5) | ~3 months |
+### 7.2 Production Exploration Later
 
-Minority-class remediation: from week 2 onward, route 10% of `default` traffic to underrepresented aliases (`swebench`, `tools_large`, `terminal_bench`) specifically to gather training examples. Tag those rows with `route_reason="minority_shaping"` and exclude from serving-quality metrics.
+Add:
 
----
+```text
+ROUTER_EXPLORATION_RATE=0.00
+ROUTER_EXPLORATION_MAX_LATENCY_CLASS=normal
+ROUTER_EXPLORATION_EXCLUDE_ALIASES=local,ocr,vision
+```
 
-## 8. Evaluation harness
+When enabled, explore only non-critical requests:
 
-Required before any model ships. Runs on a held-out 20% slice chronologically (later half of available data).
+- no images
+- no explicit local/privacy alias
+- no huge context
+- no JSON-schema hard requirement
+- no currently degraded provider set
 
-Report per model candidate:
-
-| Metric | Computation | Gate |
-|---|---|---|
-| Accuracy vs heuristic | agreement on `routed_alias` | ≥ baseline or justified drop |
-| Macro-F1 | over all aliases | ≥ 0.6 |
-| Expected latency | avg(`latency_ms`) under simulated policy | ≤ heuristic latency |
-| Oracle regret | vs. post-hoc best alias | ≤ 15% |
-| Tail p99 | `latency_ms` 99th pct | ≤ 2× heuristic's p99 |
-| 429 rate preservation | frac(`status=429`) at client | ≤ heuristic's rate |
-| Free-tier quota consumption | est. Cloudflare neurons / day | no regression |
-| Calibration ECE | for stage-2 | ≤ 5% |
-| Router inference p99 | synthetic load | ≤ 5 ms stage-1, ≤ 15 ms stage-2 |
+Log `randomized_for_exploration=true` and exclude these rows from normal serving-quality dashboards.
 
 ---
 
-## 9. Risks
+## 8. Evaluation Gates
 
-- **Concept drift from model churn.** Today's Groq kimi deprecation just invalidated ~6 aliases' ground truth. Mitigation: `provider_deprecated_at` field, retrain monthly, weight recent data higher.
-- **Reward hacking.** A single-objective router (latency-only) picks Ollama forever. Multi-objective loss in §4.4 is mandatory.
-- **Feedback loop.** If learned router always picks Groq, we stop learning about Gemini. Mitigation: keep `ROUTER_EXPLORATION_RATE=0.05` in production indefinitely.
-- **Training/serving skew.** Feature extraction at log-time must be bit-identical to inference-time. Mitigation: one `features.py` shared by both paths, unit-tested.
-- **Privacy.** User text is logged. Before training-data export: truncate `user_text_preview` to 200 chars (current), do not log embeddings of sensitive data, gate `embedding_model_id` export by env var.
-- **LLM-judge bias.** `gemma-4-26b-a4b-it` may systematically favor verbose answers. Mitigation: audit 100 judge decisions manually before trusting.
-- **Model-load failures at serve-time.** If `router_v1.lgb` fails to load, silently falling back to heuristic is fine — but must be logged loudly.
+Run `scripts/evaluate_router_policy.py` on a chronological holdout split. Do not use random split as the primary gate because provider/model behavior drifts over time.
+
+| Metric | Gate for shadow | Gate for serving 10% |
+|---|---:|---:|
+| Router inference p99 | <=2 ms | <=2 ms |
+| Status-200 rate vs heuristic | >=98% of heuristic | >=100% of heuristic |
+| 429 rate vs heuristic | no worse | lower or no worse |
+| p50 latency | no worse | >=10% better |
+| p95 latency | no worse | >=10% better |
+| Macro-F1 vs known good aliases | report only | improves minority aliases |
+| Calibration ECE | <=10% | <=5% |
+| Tool-call valid rate | no worse | no worse |
+| JSON valid rate | no worse | no worse |
+| Fallback rate to heuristic | <=30% | <=15% |
+
+Also report:
+
+- Alias distribution before/after policy.
+- Provider distribution before/after policy.
+- Quota/cost estimate per provider.
+- Worst 20 regressions with request ids.
+- SHAP or feature-importance summary for v1.
 
 ---
 
-## 10. First-day TODO when it's time to start
+## 9. Rollout Plan
 
-Pre-training (do now, before data collection continues another day):
+### Phase 0: Telemetry Repair
 
-1. Fix F1 (provider attribution regex)
-2. Fix F2 (has_tools detection)
-3. Add F3 (is_training_sample) and F5 (schema_version)
-4. Add F6 (log rotation)
+Target: 1 to 2 days.
 
-Training start (when 5k clean rows accumulate):
+- [ ] Add `router_features.py` and make `smart_router.py` use it.
+- [ ] Fix provider attribution to get unknown/missing below 10% for new rows.
+- [ ] Fix active `has_tools` detection and validate with a live tool-call request.
+- [ ] Add `schema_version`, `is_training_sample`, `request_id`, `session_id`, `response_format`.
+- [ ] Log `final_status`, `final_alias`, `total_latency_ms`, and `rescue_path`.
+- [ ] Add daily gzip rotation for routing logs.
 
-5. Write `tests/replay.py` (Phase 1 validation)
-6. Write `train_v1.py` (Phase 2 LightGBM)
-7. Export to `models/router_v1.lgb` and load in `smart_router.py` behind `ROUTER_MODE=shadow` env var
-8. Shadow for 1 week, collect `learned_alias` vs `routed_alias` agreement
-9. Flip to A/B when metrics in §5.5 gate is cleared
+Exit gate: 24 hours of v2 logs with provider unknown below 10%, realistic tool rate, and no JSONL parse failures.
 
-Everything after Phase 2 is best-effort — the LightGBM baseline alone should capture most of the available signal given the feature richness.
+### Phase 1: Baseline Data And Replay
+
+Target: 1 to 2 days after Phase 0.
+
+- [ ] Write `scripts/analyze_routing_data.py`.
+- [ ] Write `scripts/build_router_dataset.py`.
+- [ ] Write heuristic replay test: feature extraction from logs should reproduce `suggested_alias` with >=95% agreement.
+- [ ] Build legacy baseline from the current 68,212 estimated trainable rows, but mark it as exploratory.
+
+Exit gate: reproducible dataset artifact and a metrics JSON checked into `models/` or stored under `logs/training/reports/`.
+
+### Phase 2: V1 Model In Shadow Mode
+
+Target: 2 to 4 days after enough v2 rows exist.
+
+- [ ] Train tabular router.
+- [ ] Add `router_model.py`.
+- [ ] Add `ROUTER_MODE=heuristic|shadow|learned`.
+- [ ] In shadow mode, log `learned_alias`, `learned_confidence`, and `learned_utility`.
+- [ ] Add tests proving model-load failure falls back to heuristic.
+
+Exit gate: shadow metrics meet evaluation gates for 3 consecutive days.
+
+### Phase 3: 10% Learned Routing
+
+Target: after shadow gate.
+
+- [ ] Enable learned routing for 10% of eligible auto/default requests.
+- [ ] Keep explicit aliases pass-through.
+- [ ] Auto-disable learned routing if status-200 rate drops, 429 rate rises, or p95 latency regresses.
+- [ ] Continue logging heuristic and learned decisions side-by-side.
+
+Exit gate: 7 days with no regression and at least 10% latency improvement on eligible traffic.
+
+### Phase 4: Preference Labels And V2
+
+Target: after v1 is stable.
+
+- [ ] Build offline replay set from v2 rows.
+- [ ] Judge 5,000 to 10,000 pairwise outputs.
+- [ ] Train pairwise/ranking model with judged quality labels.
+- [ ] Add semantic fallback only for low-confidence cases.
+
+Exit gate: quality-sensitive replay beats v1 and heuristic on heldout judged pairs.
+
+---
+
+## 10. Immediate TODO
+
+Do these before training anything serious:
+
+1. Fix active `has_tools` logging.
+2. Fix provider attribution for new rows.
+3. Add schema v2 and `is_training_sample`.
+4. Add final outcome and rescue-path logging.
+5. Add analysis/build scripts and freeze a legacy baseline report.
+
+The raw data volume is no longer the bottleneck. The bottleneck is label correctness.
 
 ---
 
 ## References
 
-- [RouteLLM: Learning to Route LLMs with Preference Data](https://arxiv.org/abs/2406.18665) — LMSYS foundational paper
-- [RouteLLM GitHub](https://github.com/lm-sys/RouteLLM)
-- [NVIDIA LLM Router Blueprint](https://github.com/NVIDIA-AI-Blueprints/llm-router)
-- [NVIDIA prompt-task-and-complexity-classifier](https://huggingface.co/nvidia/prompt-task-and-complexity-classifier) — 11 task categories, 6 complexity dimensions
-- [vLLM Semantic Router blog](https://blog.vllm.ai/2025/09/11/semantic-router.html) — Rust + Candle + ModernBERT production architecture
-- [98× Faster LLM Routing Without a Dedicated GPU](https://arxiv.org/html/2603.12646v1) — compression + MiniLM tricks
-- [Learning to Route LLMs from Bandit Feedback](https://arxiv.org/html/2510.07429v1) — counterfactual exploration strategies
-- [LLMRank: Understanding LLM Strengths for Model Routing](https://arxiv.org/html/2510.01234v1) — feature taxonomy
-- [Anyscale: Building an LLM Router](https://www.anyscale.com/blog/building-an-llm-router-for-high-quality-and-cost-effective-responses) — 1–5 scoring rubric
-- [ModernBERT fine-tuning guide (Philipp Schmid)](https://www.philschmid.de/fine-tune-modern-bert-in-2025)
-- [Sentence-Transformers all-MiniLM-L6-v2](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) — 384-dim embeddings, 22M params
+- RouteLLM: https://arxiv.org/abs/2406.18665
+- vLLM Semantic Router blog: https://vllm.ai/blog/2025-09-11-semantic-router
+- vLLM Semantic Router repository: https://github.com/vllm-project/semantic-router
+- Not Diamond RoRF: https://github.com/Not-Diamond/RoRF
+- Bandit-feedback routing: https://arxiv.org/abs/2510.07429
+- RouterBench: https://arxiv.org/abs/2403.12031

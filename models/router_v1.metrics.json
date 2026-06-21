@@ -1,0 +1,106 @@
+{
+  "built_at": "2026-06-20T14:05:11.461943Z",
+  "n_train": 89608,
+  "n_test": 22403,
+  "global_success": 0.4034,
+  "per_class_best": [
+    {
+      "class": "text|m|plain",
+      "n": 42888,
+      "best_alias": "coding",
+      "util": 0.8748,
+      "p_success": 0.988
+    },
+    {
+      "class": "text|s|plain",
+      "n": 23862,
+      "best_alias": "tools_large",
+      "util": 0.8217,
+      "p_success": 0.935
+    },
+    {
+      "class": "tools|l|code",
+      "n": 5114,
+      "best_alias": "coding",
+      "util": 0.9492,
+      "p_success": 0.999
+    },
+    {
+      "class": "image|xl|plain",
+      "n": 4280,
+      "best_alias": "vision",
+      "util": 0.761,
+      "p_success": 0.906
+    },
+    {
+      "class": "text|xs|plain",
+      "n": 3688,
+      "best_alias": "coding",
+      "util": 0.9075,
+      "p_success": 0.981
+    },
+    {
+      "class": "text|m|code",
+      "n": 2934,
+      "best_alias": "coding",
+      "util": 0.8459,
+      "p_success": 0.95
+    },
+    {
+      "class": "tools|m|code",
+      "n": 1302,
+      "best_alias": "coding",
+      "util": 0.9472,
+      "p_success": 0.999
+    },
+    {
+      "class": "tools|xl|code",
+      "n": 1230,
+      "best_alias": "coding",
+      "util": 0.9359,
+      "p_success": 0.999
+    },
+    {
+      "class": "text|s|code",
+      "n": 765,
+      "best_alias": "tools_large",
+      "util": 0.8213,
+      "p_success": 0.935
+    },
+    {
+      "class": "text|l|plain",
+      "n": 709,
+      "best_alias": "tools_large",
+      "util": 0.8167,
+      "p_success": 0.925
+    },
+    {
+      "class": "text|m|json",
+      "n": 698,
+      "best_alias": "coding",
+      "util": 0.8185,
+      "p_success": 0.944
+    },
+    {
+      "class": "text|xl|code",
+      "n": 446,
+      "best_alias": "tools_large",
+      "util": 0.8167,
+      "p_success": 0.925
+    },
+    {
+      "class": "tools|xs|code",
+      "n": 417,
+      "best_alias": "coding",
+      "util": 0.948,
+      "p_success": 0.999
+    },
+    {
+      "class": "tools|xs|plain",
+      "n": 359,
+      "best_alias": "coding",
+      "util": 0.948,
+      "p_success": 0.999
+    }
+  ]
+}

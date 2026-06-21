@@ -294,13 +294,20 @@ echo ""
 # ─────────────────────────────────────────────────────────────────
 echo "--- T9: Large prompts (no 413) ---"
 for size in 4000 20000 50000; do
-    PAD=$(python3 -c "print('x' * $size)")
-    result=$(chat "{
-        \"model\":\"tools\",
-        \"messages\":[{\"role\":\"user\",\"content\":\"Fix: $PAD\"}],
-        \"tools\":$TOOL_DEF,
-        \"max_tokens\":20
-    }" 60)
+    # Write to temp file — shell arg passing corrupts large strings
+    _t9tmp=$(mktemp)
+    python3 -c "
+import json, sys
+body = {'model':'tools','stream':False,'max_tokens':20,
+        'messages':[{'role':'user','content':'Fix: '+'x'*$size}],
+        'tools':$TOOL_DEF}
+print(json.dumps(body))
+" > "$_t9tmp"
+    result=$(curl -s --max-time 60 "$GATEWAY/chat/completions" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $API_KEY" \
+        -d "@$_t9tmp" 2>/dev/null)
+    rm -f "$_t9tmp"
     status=$(printf "%s" "$result" | get_status)
     if [ "$status" = "200" ]; then
         pass "${size}-char prompt accepted"
@@ -517,6 +524,91 @@ echo ""
 
 # ─────────────────────────────────────────────────────────────────
 # T21: Provider status endpoint
+# ─────────────────────────────────────────────────────────────────
+# T22: H1 OCR models loaded — evict true squatters, load required OCR models
+# ─────────────────────────────────────────────────────────────────
+# VRAM budget (24GB GPU, H1):
+#   qwen3.5:9b  = 14.5GB  (gateway's permanent model — NOT a squatter)
+#   LightOnOCR-2 = 3.0GB  (fits with qwen3.5:9b: 17.5GB total)
+#   glm-ocr      = 0GB    (CPU-only)
+#   deepseek-ocr = 9.5GB  (would need 27GB alongside both — excluded from required)
+# ─────────────────────────────────────────────────────────────────
+echo "--- T22: H1 OCR model warmth ---"
+# Models that must be warm for OCR to work locally.
+OCR_REQUIRED=("maternion/LightOnOCR-2:latest" "glm-ocr:latest")
+OCR_CPU=("glm-ocr:latest")
+# Gateway's permanent model — always loaded, not a squatter.
+OCR_GATEWAY_MODELS=("qwen3.5:9b")
+
+# Discover H1 URL from router health (first healthy Ollama host that isn't /v1)
+H1_URL=$(curl -sf --max-time 5 "$ROUTER_HEALTH" 2>/dev/null \
+    | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+for h,s in d.get('ollama_hosts',{}).items():
+    if isinstance(s,dict) and s.get('healthy') and '/v1' not in s.get('url',''):
+        print(s['url']); break
+" 2>/dev/null)
+
+if [ -z "$H1_URL" ]; then
+    warn "T22: could not determine H1 URL from router health — skipping OCR check"
+else
+    ps_json=$(curl --noproxy '*' -sf --connect-timeout 5 --max-time 10 "$H1_URL/api/ps" 2>/dev/null || echo '{"models":[]}')
+    loaded=$(echo "$ps_json" | python3 -c "import sys,json; print('\n'.join(m['name'] for m in json.load(sys.stdin).get('models',[])))" 2>/dev/null || true)
+
+    # Detect true squatters: non-OCR models excluding the gateway's permanent model.
+    squatters=$(python3 -c "
+ocr={'maternion/LightOnOCR-2:latest','deepseek-ocr:latest','glm-ocr:latest'}
+gateway={'qwen3.5:9b'}
+loaded='''$loaded'''.strip().splitlines()
+print('\n'.join(m for m in loaded if m and m not in ocr and m not in gateway))
+" 2>/dev/null)
+
+    missing=""
+    for m in "${OCR_REQUIRED[@]}"; do
+        echo "$loaded" | grep -qxF "$m" || missing="$missing $m"
+    done
+
+    if [ -n "$squatters" ]; then
+        echo "  INFO: squatters: $(echo "$squatters" | tr '\n' ' ')"
+        echo "  INFO: flushing squatters..."
+        # Flush only the squatters, leave OCR + gateway models intact.
+        while IFS= read -r m; do
+            [ -z "$m" ] && continue
+            curl --noproxy '*' -s --max-time 30 -X POST "$H1_URL/api/generate" \
+                -H 'Content-Type: application/json' \
+                -d "{\"model\":\"$m\",\"prompt\":\"x\",\"stream\":false,\"keep_alive\":0,\"options\":{\"num_predict\":1}}" \
+                > /dev/null 2>&1 || true
+        done <<< "$squatters"
+    fi
+
+    if [ -n "$missing" ]; then
+        echo "  INFO: missing:$(echo "$missing")"
+        echo "  INFO: loading missing OCR models..."
+        reload_ok=1
+        for m in "${OCR_REQUIRED[@]}"; do
+            echo "$loaded" | grep -qxF "$m" && continue   # already loaded
+            is_cpu=0
+            for c in "${OCR_CPU[@]}"; do [ "$c" = "$m" ] && is_cpu=1; done
+            num_gpu=$( [ "$is_cpu" -eq 1 ] && echo 0 || echo 99 )
+            resp=$(curl --noproxy '*' -s --max-time 300 -X POST "$H1_URL/api/generate" \
+                -H 'Content-Type: application/json' \
+                -d "{\"model\":\"$m\",\"prompt\":\"OCR_OK\",\"stream\":false,\"keep_alive\":\"1h\",\"options\":{\"num_predict\":4,\"num_gpu\":$num_gpu}}" 2>/dev/null || echo '{}')
+            if echo "$resp" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('done') and not d.get('error') else 1)" 2>/dev/null; then
+                echo "  INFO: loaded $m"
+            else
+                echo "  WARN: failed to load $m"
+                reload_ok=0
+            fi
+        done
+        [ "$reload_ok" -eq 1 ] && pass "H1 OCR models loaded (was stale)" || fail "H1 OCR reload incomplete"
+    elif [ -n "$squatters" ]; then
+        pass "H1 OCR models already warm (flushed squatters)"
+    else
+        pass "H1 OCR models all warm"
+    fi
+fi
+
 # ─────────────────────────────────────────────────────────────────
 echo "--- T21: Provider status & model identity ---"
 pstatus=$(curl -sf --max-time 5 "$GATEWAY_BASE/router/provider-status" 2>/dev/null)

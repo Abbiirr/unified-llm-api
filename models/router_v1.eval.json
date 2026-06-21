@@ -1,0 +1,40 @@
+{
+  "train": 90767,
+  "test": 22692,
+  "agree": 29,
+  "differ": 22663,
+  "coverage_rows": 6656.0,
+  "heuristic_success": 0.6832802988378528,
+  "learned_success": 0.8629229844674556,
+  "lift": 0.17964268562960284,
+  "inference_us_per_call": 20.2,
+  "per_class": [
+    {
+      "class": "text|s|plain",
+      "freq": 6358,
+      "heuristic": "default",
+      "h_sr": 0.669,
+      "learned": "tools_large",
+      "l_sr": 0.864,
+      "delta": 0.195
+    },
+    {
+      "class": "text|xs|plain",
+      "freq": 269,
+      "heuristic": "fast",
+      "h_sr": 1.0,
+      "learned": "coding",
+      "l_sr": 0.846,
+      "delta": -0.154
+    },
+    {
+      "class": "text|m|json",
+      "freq": 29,
+      "heuristic": "coding",
+      "h_sr": 0.862,
+      "learned": "coding",
+      "l_sr": 0.862,
+      "delta": 0.0
+    }
+  ]
+}
