@@ -124,5 +124,8 @@ fi
 
 while true; do
     check_and_fix || log "check_and_fix exited $? — continuing"
+    # ponytail: cap litellm gateway.log at 500MB (verbose 429-storm spam grows ~5G/2h); truncate-in-place is safe for the O_APPEND writer. Upgrade to logrotate if other logs grow too.
+    GW="$ROOT_DIR/logs/litellm/gateway.log"
+    [ -f "$GW" ] && [ "$(stat -c%s "$GW" 2>/dev/null || echo 0)" -gt 524288000 ] && : > "$GW"
     sleep "$CHECK_INTERVAL" || true
 done

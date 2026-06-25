@@ -1,40 +1,40 @@
 {
-  "train": 90767,
-  "test": 22692,
-  "agree": 29,
-  "differ": 22663,
-  "coverage_rows": 6656.0,
-  "heuristic_success": 0.6832802988378528,
-  "learned_success": 0.8629229844674556,
-  "lift": 0.17964268562960284,
-  "inference_us_per_call": 20.2,
+  "train": 49962,
+  "test": 12491,
+  "agree": 471,
+  "differ": 12020,
+  "coverage_rows": 2319.0,
+  "heuristic_success": 0.6703751617076326,
+  "learned_success": 0.9173645047197122,
+  "lift": 0.2469893430120796,
+  "inference_us_per_call": 18.3,
   "per_class": [
     {
       "class": "text|s|plain",
-      "freq": 6358,
+      "freq": 1806,
       "heuristic": "default",
-      "h_sr": 0.669,
-      "learned": "tools_large",
-      "l_sr": 0.864,
-      "delta": 0.195
+      "h_sr": 0.6,
+      "learned": "fast",
+      "l_sr": 0.913,
+      "delta": 0.313
     },
     {
       "class": "text|xs|plain",
-      "freq": 269,
+      "freq": 471,
       "heuristic": "fast",
       "h_sr": 1.0,
-      "learned": "coding",
-      "l_sr": 0.846,
-      "delta": -0.154
+      "learned": "fast",
+      "l_sr": 1.0,
+      "delta": 0.0
     },
     {
-      "class": "text|m|json",
-      "freq": 29,
-      "heuristic": "coding",
-      "h_sr": 0.862,
-      "learned": "coding",
-      "l_sr": 0.862,
-      "delta": 0.0
+      "class": "text|xl|code",
+      "freq": 42,
+      "heuristic": "local",
+      "h_sr": 0.0,
+      "learned": "tools_large",
+      "l_sr": 0.176,
+      "delta": 0.176
     }
   ]
 }

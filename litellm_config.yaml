@@ -1030,7 +1030,7 @@ model_list:
   litellm_params:
     model: cerebras/gpt-oss-120b
     api_key: os.environ/CEREBRAS_API_KEY
-    order: 1
+    order: 0
     cooldown_time: 60
   model_info:
     max_input_tokens: 65536
@@ -1063,8 +1063,8 @@ model_list:
   litellm_params:
     model: groq/meta-llama/llama-4-scout-17b-16e-instruct
     api_key: os.environ/GROQ_API_KEY
-    order: 0
-    cooldown_time: 30
+    order: 90
+    cooldown_time: 60
   model_info:
     max_input_tokens: 131072
 - model_name: default_cloud
@@ -1652,6 +1652,14 @@ model_list:
   litellm_params:
     model: groq/meta-llama/llama-4-scout-17b-16e-instruct
     api_key: os.environ/GROQ_API_KEY
+    order: 90
+    cooldown_time: 60
+  model_info:
+    max_input_tokens: 131072
+- model_name: tools_cloud
+  litellm_params:
+    model: gemini/gemini-3.1-flash-lite
+    api_key: os.environ/GEMINI_API_KEY
     order: 1
     cooldown_time: 60
   model_info:
@@ -1660,7 +1668,7 @@ model_list:
   litellm_params:
     model: groq/meta-llama/llama-4-scout-17b-16e-instruct
     api_key: os.environ/GROQ_API_KEY
-    order: 1
+    order: 90
     cooldown_time: 60
   model_info:
     max_input_tokens: 131072
